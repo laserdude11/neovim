@@ -12,14 +12,20 @@
 
 #define MESSAGE_FILE            /* don't include prototype for smsg() */
 
+#include <errno.h>
+#include <inttypes.h>
+#include <stdbool.h>
+#include <stdarg.h>
 #include <string.h>
 #include <math.h>
 
 #include "nvim/vim.h"
+#include "nvim/ascii.h"
 #include "nvim/message.h"
 #include "nvim/charset.h"
 #include "nvim/eval.h"
 #include "nvim/ex_eval.h"
+#include "nvim/ex_docmd.h"
 #include "nvim/fileio.h"
 #include "nvim/func_attr.h"
 #include "nvim/getchar.h"
@@ -52,6 +58,10 @@ struct msgchunk_S {
   int sb_attr;                  /* text attributes */
   char_u sb_text[1];            /* text to be displayed, actually longer */
 };
+
+/* Magic chars used in confirm dialog strings */
+#define DLG_BUTTON_SEP  '\n'
+#define DLG_HOTKEY_CHAR '&'
 
 static int confirm_msg_used = FALSE;            /* displaying confirm_msg */
 #ifdef INCLUDE_GENERATED_DECLARATIONS
@@ -777,7 +787,7 @@ void wait_return(int redraw)
   } else {
     /* Make sure the hit-return prompt is on screen when 'guioptions' was
      * just changed. */
-    screenalloc(FALSE);
+    screenalloc(false);
 
     State = HITRETURN;
     setmouse();
@@ -2064,7 +2074,7 @@ static int do_more_prompt(int typed_char)
     toscroll = 0;
     switch (c) {
     case K_EVENT:
-      event_process(true);
+      event_process();
       break;
     case BS:                    /* scroll one line back */
     case K_BS:
@@ -2257,8 +2267,8 @@ void mch_errmsg(char *str)
   emsg_on_display = FALSE;
 
   len = (int)STRLEN(str) + 1;
-  if (error_ga.ga_growsize == 0) {
-    error_ga.ga_growsize = 80;
+  if (error_ga.ga_data == NULL) {
+    ga_set_growsize(&error_ga, 80);
     error_ga.ga_itemsize = 1;
   }
   ga_grow(&error_ga, len);
@@ -2612,7 +2622,7 @@ int verbose_open(void)
  * Give a warning message (for searching).
  * Use 'w' highlighting and may repeat the message after redrawing
  */
-void give_warning(char_u *message, int hl)
+void give_warning(char_u *message, bool hl)
 {
   /* Don't do this for ":silent". */
   if (msg_silent != 0)
@@ -2724,8 +2734,11 @@ do_dialog (
       retval = 0;
       break;
     default:                  /* Could be a hotkey? */
-      if (c < 0)              /* special keys are ignored here */
+      if (c < 0) {            /* special keys are ignored here */
+        // drain event queue to prevent infinite loop
+        event_process();
         continue;
+      }
       if (c == ':' && ex_cmd) {
         retval = dfltbutton;
         ins_char_typebuf(':');
@@ -3160,8 +3173,7 @@ int vim_vsnprintf(char *str, size_t str_m, char *fmt, va_list ap, typval_T *tvs)
     p = "";
   while (*p != NUL) {
     if (*p != '%') {
-      char    *q = strchr(p + 1, '%');
-      size_t n = (q == NULL) ? STRLEN(p) : (size_t)(q - p);
+      size_t n = xstrchrnul(p + 1, '%') - p;
 
       /* Copy up to the next '%' or NUL without any changes. */
       if (str_l < str_m) {

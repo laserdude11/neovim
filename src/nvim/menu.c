@@ -11,9 +11,11 @@
  * Code for menus.  Used for the GUI and 'wildmenu'.
  */
 
+#include <inttypes.h>
 #include <string.h>
 
 #include "nvim/vim.h"
+#include "nvim/ascii.h"
 #include "nvim/menu.h"
 #include "nvim/charset.h"
 #include "nvim/cursor.h"
@@ -1183,21 +1185,7 @@ static char_u *menu_text(char_u *str, int *mnemonic, char_u **actext)
       if (p[1] == NUL)              /* trailing "&" */
         break;
       if (mnemonic != NULL && p[1] != '&')
-#if !defined(__MVS__) || defined(MOTIF390_MNEMONIC_FIXED)
         *mnemonic = p[1];
-#else
-      {
-        /*
-         * Well there is a bug in the Motif libraries on OS390 Unix.
-         * The mnemonic keys needs to be converted to ASCII values
-         * first.
-         * This behavior has been seen in 2.8 and 2.9.
-         */
-        char c = p[1];
-        __etoa_l(&c, 1);
-        *mnemonic = c;
-      }
-#endif
       STRMOVE(p, p + 1);
       p = p + 1;
     }
@@ -1434,7 +1422,7 @@ typedef struct {
   char_u      *to;              /* translated name */
 } menutrans_T;
 
-static garray_T menutrans_ga = {0, 0, 0, 0, NULL};
+static garray_T menutrans_ga = GA_EMPTY_INIT_VALUE;
 
 /*
  * ":menutrans".
@@ -1444,7 +1432,6 @@ static garray_T menutrans_ga = {0, 0, 0, 0, NULL};
 void ex_menutranslate(exarg_T *eap)
 {
   char_u              *arg = eap->arg;
-  menutrans_T         *tp;
   char_u              *from, *from_noamp, *to;
 
   if (menutrans_ga.ga_itemsize == 0)
@@ -1454,7 +1441,7 @@ void ex_menutranslate(exarg_T *eap)
    * ":menutrans clear": clear all translations.
    */
   if (STRNCMP(arg, "clear", 5) == 0 && ends_excmd(*skipwhite(arg + 5))) {
-    tp = (menutrans_T *)menutrans_ga.ga_data;
+    menutrans_T *tp = (menutrans_T *)menutrans_ga.ga_data;
     for (int i = 0; i < menutrans_ga.ga_len; ++i) {
       free(tp[i].from);
       free(tp[i].from_noamp);
@@ -1473,8 +1460,6 @@ void ex_menutranslate(exarg_T *eap)
     if (arg == to)
       EMSG(_(e_invarg));
     else {
-      ga_grow(&menutrans_ga, 1);
-      tp = (menutrans_T *)menutrans_ga.ga_data;
       from = vim_strsave(from);
       from_noamp = menu_text(from, NULL, NULL);
       to = vim_strnsave(to, (int)(arg - to));
@@ -1483,10 +1468,10 @@ void ex_menutranslate(exarg_T *eap)
         menu_translate_tab_and_shift(to);
         menu_unescape_name(from);
         menu_unescape_name(to);
-        tp[menutrans_ga.ga_len].from = from;
-        tp[menutrans_ga.ga_len].from_noamp = from_noamp;
-        tp[menutrans_ga.ga_len].to = to;
-        ++menutrans_ga.ga_len;
+        menutrans_T* tp = GA_APPEND_VIA_PTR(menutrans_T, &menutrans_ga);
+        tp->from = from;
+        tp->from_noamp = from_noamp;
+        tp->to = to;
       } else {
         free(from);
         free(from_noamp);

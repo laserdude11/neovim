@@ -41,8 +41,12 @@
  *  mf_get().
  */
 
+#include <errno.h>
+#include <inttypes.h>
 #include <string.h>
+#include <stdbool.h>
 
+#include "nvim/ascii.h"
 #include "nvim/vim.h"
 #include "nvim/memline.h"
 #include "nvim/buffer.h"
@@ -65,6 +69,7 @@
 #include "nvim/spell.h"
 #include "nvim/strings.h"
 #include "nvim/term.h"
+#include "nvim/tempfile.h"
 #include "nvim/ui.h"
 #include "nvim/undo.h"
 #include "nvim/window.h"
@@ -264,7 +269,7 @@ int ml_open(buf_T *buf)
   buf->b_ml.ml_chunksize = NULL;
 
   if (cmdmod.noswapfile) {
-    buf->b_p_swf = FALSE;
+    buf->b_p_swf = false;
   }
 
   /*
@@ -436,7 +441,7 @@ void ml_setname(buf_T *buf)
   }
 
   if (mfp->mf_fd == -1) {           /* need to (re)open the swap file */
-    mfp->mf_fd = mch_open((char *)mfp->mf_fname, O_RDWR, 0);
+    mfp->mf_fd = os_open((char *)mfp->mf_fname, O_RDWR, 0);
     if (mfp->mf_fd < 0) {
       /* could not (re)open the swap file, what can we do???? */
       EMSG(_("E301: Oops, lost the swap file!!!"));
@@ -461,11 +466,11 @@ void ml_setname(buf_T *buf)
  */
 void ml_open_files(void)
 {
-  buf_T       *buf;
-
-  for (buf = firstbuf; buf != NULL; buf = buf->b_next)
-    if (!buf->b_p_ro || buf->b_changed)
+  FOR_ALL_BUFFERS(buf) {
+    if (!buf->b_p_ro || buf->b_changed) {
       ml_open_file(buf);
+    }
+  }
 }
 
 /*
@@ -486,7 +491,7 @@ void ml_open_file(buf_T *buf)
 
   /* For a spell buffer use a temp file name. */
   if (buf->b_spell) {
-    fname = vim_tempname('s');
+    fname = vim_tempname();
     if (fname != NULL)
       (void)mf_open_file(mfp, fname);           /* consumes fname! */
     buf->b_may_swap = FALSE;
@@ -579,15 +584,12 @@ void ml_close(buf_T *buf, int del_file)
  */
 void ml_close_all(int del_file)
 {
-  buf_T       *buf;
-
-  for (buf = firstbuf; buf != NULL; buf = buf->b_next)
+  FOR_ALL_BUFFERS(buf) {
     ml_close(buf, del_file && ((buf->b_flags & BF_PRESERVED) == 0
                                || vim_strchr(p_cpo, CPO_PRESERVE) == NULL));
+  }
   spell_delete_wordlist();      /* delete the internal wordlist */
-#ifdef TEMPDIRNAMES
   vim_deltempdir();             /* delete created temp directory */
-#endif
 }
 
 /*
@@ -596,11 +598,11 @@ void ml_close_all(int del_file)
  */
 void ml_close_notmod(void)
 {
-  buf_T       *buf;
-
-  for (buf = firstbuf; buf != NULL; buf = buf->b_next)
-    if (!bufIsChanged(buf))
+  FOR_ALL_BUFFERS(buf) {
+    if (!bufIsChanged(buf)) {
       ml_close(buf, TRUE);          /* close all not-modified buffers */
+    }
+  }
 }
 
 /*
@@ -684,18 +686,14 @@ static void set_b0_fname(ZERO_BL *b0p, buf_T *buf)
       }
     }
     FileInfo file_info;
-    if (os_get_file_info((char *)buf->b_ffname, &file_info)) {
+    if (os_fileinfo((char *)buf->b_ffname, &file_info)) {
       long_to_char((long)file_info.stat.st_mtim.tv_sec, b0p->b0_mtime);
-#ifdef CHECK_INODE
-      long_to_char((long)file_info.stat.st_ino, b0p->b0_ino);
-#endif
+      long_to_char((long)os_fileinfo_inode(&file_info), b0p->b0_ino);
       buf_store_file_info(buf, &file_info);
       buf->b_mtime_read = buf->b_mtime;
     } else {
       long_to_char(0L, b0p->b0_mtime);
-#ifdef CHECK_INODE
       long_to_char(0L, b0p->b0_ino);
-#endif
       buf->b_mtime = 0;
       buf->b_mtime_read = 0;
       buf->b_orig_size = 0;
@@ -963,8 +961,8 @@ void ml_recover(void)
   FileInfo swp_file_info;
   mtime = char_to_long(b0p->b0_mtime);
   if (curbuf->b_ffname != NULL
-      && os_get_file_info((char *)curbuf->b_ffname, &org_file_info)
-      && ((os_get_file_info((char *)mfp->mf_fname, &swp_file_info)
+      && os_fileinfo((char *)curbuf->b_ffname, &org_file_info)
+      && ((os_fileinfo((char *)mfp->mf_fname, &swp_file_info)
            && org_file_info.stat.st_mtim.tv_sec
               > swp_file_info.stat.st_mtim.tv_sec)
           || org_file_info.stat.st_mtim.tv_sec != mtime)) {
@@ -1496,7 +1494,7 @@ static time_t swapfile_info(char_u *fname)
 
   /* print the swap file date */
   FileInfo file_info;
-  if (os_get_file_info((char *)fname, &file_info)) {
+  if (os_fileinfo((char *)fname, &file_info)) {
 #ifdef UNIX
     /* print name of owner of the file */
     if (os_get_uname(file_info.stat.st_uid, uname, B0_UNAME_SIZE) == OK) {
@@ -1517,7 +1515,7 @@ static time_t swapfile_info(char_u *fname)
   /*
    * print the original file name
    */
-  fd = mch_open((char *)fname, O_RDONLY, 0);
+  fd = os_open((char *)fname, O_RDONLY, 0);
   if (fd >= 0) {
     if (read_eintr(fd, &b0, sizeof(b0)) == sizeof(b0)) {
       if (STRNCMP(b0.b0_version, "VIM 3.0", 7) == 0) {
@@ -1618,9 +1616,7 @@ static int recov_file_names(char_u **names, char_u *path, int prepend_dot)
  */
 void ml_sync_all(int check_file, int check_char)
 {
-  buf_T               *buf;
-
-  for (buf = firstbuf; buf != NULL; buf = buf->b_next) {
+  FOR_ALL_BUFFERS(buf) {
     if (buf->b_ml.ml_mfp == NULL || buf->b_ml.ml_mfp->mf_fname == NULL)
       continue;                             /* no file */
 
@@ -1634,9 +1630,9 @@ void ml_sync_all(int check_file, int check_char)
        * call ml_preserve() to get rid of all negative numbered blocks.
        */
       FileInfo file_info;
-      if (!os_get_file_info((char *)buf->b_ffname, &file_info)
+      if (!os_fileinfo((char *)buf->b_ffname, &file_info)
           || file_info.stat.st_mtim.tv_sec != buf->b_mtime_read
-          || (off_t)file_info.stat.st_size != buf->b_orig_size) {
+          || os_fileinfo_size(&file_info) != buf->b_orig_size) {
         ml_preserve(buf, FALSE);
         did_check_timestamps = FALSE;
         need_check_timestamps = TRUE;           /* give message later */
@@ -3184,7 +3180,7 @@ attention_message (
   msg_outtrans(buf->b_fname);
   MSG_PUTS("\"\n");
   FileInfo file_info;
-  if (os_get_file_info((char *)buf->b_fname, &file_info)) {
+  if (os_fileinfo((char *)buf->b_fname, &file_info)) {
     MSG_PUTS(_("             dated: "));
     x = file_info.stat.st_mtim.tv_sec;
     p = ctime(&x);  // includes '\n'
@@ -3298,7 +3294,7 @@ findswapname (
     // Extra security check: When a swap file is a symbolic link, this
     // is most likely a symlink attack.
     FileInfo file_info;
-    bool file_or_link_found = os_get_file_info_link((char *)fname, &file_info);
+    bool file_or_link_found = os_fileinfo_link((char *)fname, &file_info);
     if (!file_or_link_found) {
       break;
     }
@@ -3329,7 +3325,7 @@ findswapname (
          * Try to read block 0 from the swap file to get the original
          * file name (and inode number).
          */
-        fd = mch_open((char *)fname, O_RDONLY, 0);
+        fd = os_open((char *)fname, O_RDONLY, 0);
         if (fd >= 0) {
           if (read_eintr(fd, &b0, sizeof(b0)) == sizeof(b0)) {
             /*
@@ -3339,17 +3335,16 @@ findswapname (
              */
             if (b0.b0_flags & B0_SAME_DIR) {
               if (fnamecmp(path_tail(buf->b_ffname),
-                      path_tail(b0.b0_fname)) != 0
+                           path_tail(b0.b0_fname)) != 0
                   || !same_directory(fname, buf->b_ffname)) {
-#ifdef CHECK_INODE
                 /* Symlinks may point to the same file even
                  * when the name differs, need to check the
                  * inode too. */
                 expand_env(b0.b0_fname, NameBuff, MAXPATHL);
                 if (fnamecmp_ino(buf->b_ffname, NameBuff,
-                        char_to_long(b0.b0_ino)))
-#endif
-                differ = TRUE;
+                    char_to_long(b0.b0_ino))) {
+                  differ = TRUE;
+                }
               }
             } else {
               /*
@@ -3357,14 +3352,10 @@ findswapname (
                * "~user/path/file".  Expand it first.
                */
               expand_env(b0.b0_fname, NameBuff, MAXPATHL);
-#ifdef CHECK_INODE
               if (fnamecmp_ino(buf->b_ffname, NameBuff,
-                      char_to_long(b0.b0_ino)))
+                  char_to_long(b0.b0_ino))) {
                 differ = TRUE;
-#else
-              if (fnamecmp(NameBuff, buf->b_ffname) != 0)
-                differ = TRUE;
-#endif
+              }
             }
           }
           close(fd);
@@ -3504,7 +3495,6 @@ static int b0_magic_wrong(ZERO_BL *b0p)
          || b0p->b0_magic_char != B0_MAGIC_CHAR;
 }
 
-#ifdef CHECK_INODE
 /*
  * Compare current file name with file name from swap file.
  * Try to use inode numbers when possible.
@@ -3549,28 +3539,27 @@ static int b0_magic_wrong(ZERO_BL *b0p)
  * available -> probably same file
  *		== 0   == 0    FAIL	FAIL	FALSE
  *
- * Note that when the ino_t is 64 bits, only the last 32 will be used.  This
- * can't be changed without making the block 0 incompatible with 32 bit
- * versions.
+ * Only the last 32 bits of the inode will be used. This can't be changed
+ * without making the block 0 incompatible with 32 bit versions.
  */
 
-static int 
+static int
 fnamecmp_ino (
     char_u *fname_c,               /* current file name */
     char_u *fname_s,               /* file name from swap file */
     long ino_block0
 )
 {
-  ino_t ino_c = 0;                  /* ino of current file */
-  ino_t ino_s;                      /* ino of file from swap file */
+  uint64_t ino_c = 0;               /* ino of current file */
+  uint64_t ino_s;                   /* ino of file from swap file */
   char_u buf_c[MAXPATHL];           /* full path of fname_c */
   char_u buf_s[MAXPATHL];           /* full path of fname_s */
   int retval_c;                     /* flag: buf_c valid */
   int retval_s;                     /* flag: buf_s valid */
 
   FileInfo file_info;
-  if (os_get_file_info((char *)fname_c, &file_info)) {
-    ino_c = (ino_t)file_info.stat.st_ino;
+  if (os_fileinfo((char *)fname_c, &file_info)) {
+    ino_c = os_fileinfo_inode(&file_info);
   }
 
   /*
@@ -3578,10 +3567,10 @@ fnamecmp_ino (
    * the swap file may be outdated.  If that fails (e.g. this path is not
    * valid on this machine), use the inode from block 0.
    */
-  if (os_get_file_info((char *)fname_s, &file_info)) {
-    ino_s = (ino_t)file_info.stat.st_ino;
+  if (os_fileinfo((char *)fname_s, &file_info)) {
+    ino_s = os_fileinfo_inode(&file_info);
   } else {
-    ino_s = (ino_t)ino_block0;
+    ino_s = (uint64_t)ino_block0;
   }
 
   if (ino_c && ino_s)
@@ -3604,7 +3593,6 @@ fnamecmp_ino (
     return FALSE;
   return TRUE;
 }
-#endif /* CHECK_INODE */
 
 /*
  * Move a long integer into a four byte character array.

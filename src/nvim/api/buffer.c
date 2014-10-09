@@ -1,5 +1,7 @@
 // Much of this code was adapted from 'if_py_both.h' from the original
 // vim source
+#include <errno.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 
@@ -29,7 +31,7 @@
 /// @param buffer The buffer handle
 /// @param[out] err Details of an error that may have occurred
 /// @return The line count
-Integer buffer_get_length(Buffer buffer, Error *err)
+Integer buffer_line_count(Buffer buffer, Error *err)
 {
   buf_T *buf = find_buffer_by_handle(buffer, err);
 
@@ -49,10 +51,10 @@ Integer buffer_get_length(Buffer buffer, Error *err)
 String buffer_get_line(Buffer buffer, Integer index, Error *err)
 {
   String rv = {.size = 0};
-  StringArray slice = buffer_get_slice(buffer, index, index, true, true, err);
+  Array slice = buffer_get_line_slice(buffer, index, index, true, true, err);
 
   if (!err->set && slice.size) {
-    rv = slice.items[0];
+    rv = slice.items[0].data.string;
   }
 
   free(slice.items);
@@ -68,8 +70,9 @@ String buffer_get_line(Buffer buffer, Integer index, Error *err)
 /// @param[out] err Details of an error that may have occurred
 void buffer_set_line(Buffer buffer, Integer index, String line, Error *err)
 {
-  StringArray array = {.items = &line, .size = 1};
-  buffer_set_slice(buffer, index, index, true, true, array, err);
+  Object l = STRING_OBJ(line);
+  Array array = {.items = &l, .size = 1};
+  buffer_set_line_slice(buffer, index, index, true, true, array, err);
 }
 
 /// Deletes a buffer line
@@ -79,8 +82,8 @@ void buffer_set_line(Buffer buffer, Integer index, String line, Error *err)
 /// @param[out] err Details of an error that may have occurred
 void buffer_del_line(Buffer buffer, Integer index, Error *err)
 {
-  StringArray array = ARRAY_DICT_INIT;
-  buffer_set_slice(buffer, index, index, true, true, array, err);
+  Array array = ARRAY_DICT_INIT;
+  buffer_set_line_slice(buffer, index, index, true, true, array, err);
 }
 
 /// Retrieves a line range from the buffer
@@ -92,14 +95,14 @@ void buffer_del_line(Buffer buffer, Integer index, Error *err)
 /// @param include_end True if the slice includes the `end` parameter
 /// @param[out] err Details of an error that may have occurred
 /// @return An array of lines
-StringArray buffer_get_slice(Buffer buffer,
-                             Integer start,
-                             Integer end,
-                             Boolean include_start,
-                             Boolean include_end,
-                             Error *err)
+ArrayOf(String) buffer_get_line_slice(Buffer buffer,
+                                 Integer start,
+                                 Integer end,
+                                 Boolean include_start,
+                                 Boolean include_end,
+                                 Error *err)
 {
-  StringArray rv = ARRAY_DICT_INIT;
+  Array rv = ARRAY_DICT_INIT;
   buf_T *buf = find_buffer_by_handle(buffer, err);
 
   if (!buf) {
@@ -107,6 +110,7 @@ StringArray buffer_get_slice(Buffer buffer,
   }
 
   start = normalize_index(buf, start) + (include_start ? 0 : 1);
+  include_end = include_end || (end >= buf->b_ml.ml_line_count);
   end = normalize_index(buf, end) + (include_end ? 1 : 0);
 
   if (start >= end) {
@@ -115,24 +119,24 @@ StringArray buffer_get_slice(Buffer buffer,
   }
 
   rv.size = (size_t)(end - start);
-  rv.items = xcalloc(sizeof(String), rv.size);
+  rv.items = xcalloc(sizeof(Object), rv.size);
 
   for (size_t i = 0; i < rv.size; i++) {
     int64_t lnum = start + (int64_t)i;
 
     if (lnum > LONG_MAX) {
-      set_api_error("Line index is too high", err);
+      api_set_error(err, Validation, _("Line index is too high"));
       goto end;
     }
 
     const char *bufstr = (char *) ml_get_buf(buf, (linenr_T) lnum, false);
-    rv.items[i] = cstr_to_string(bufstr);
+    rv.items[i] = STRING_OBJ(cstr_to_string(bufstr));
   }
 
 end:
   if (err->set) {
     for (size_t i = 0; i < rv.size; i++) {
-      free(rv.items[i].data);
+      free(rv.items[i].data.string.data);
     }
 
     free(rv.items);
@@ -149,15 +153,15 @@ end:
 /// @param end The last line index
 /// @param include_start True if the slice includes the `start` parameter
 /// @param include_end True if the slice includes the `end` parameter
-/// @param lines An array of lines to use as replacement(A 0-length array
-///        will simply delete the line range)
+/// @param replacement An array of lines to use as replacement(A 0-length
+//         array will simply delete the line range)
 /// @param[out] err Details of an error that may have occurred
-void buffer_set_slice(Buffer buffer,
+void buffer_set_line_slice(Buffer buffer,
                       Integer start,
                       Integer end,
                       Boolean include_start,
                       Boolean include_end,
-                      StringArray replacement,
+                      ArrayOf(String) replacement,
                       Error *err)
 {
   buf_T *buf = find_buffer_by_handle(buffer, err);
@@ -167,10 +171,13 @@ void buffer_set_slice(Buffer buffer,
   }
 
   start = normalize_index(buf, start) + (include_start ? 0 : 1);
+  include_end = include_end || (end >= buf->b_ml.ml_line_count);
   end = normalize_index(buf, end) + (include_end ? 1 : 0);
 
   if (start > end) {
-    set_api_error("start > end", err);
+    api_set_error(err,
+                  Validation,
+                  _("Argument \"start\" is higher than \"end\""));
     return;
   }
 
@@ -180,10 +187,17 @@ void buffer_set_slice(Buffer buffer,
   size_t new_len = replacement.size;
   size_t old_len = (size_t)(end - start);
   ssize_t extra = 0;  // lines added to text, can be negative
-  char **lines = (new_len != 0) ? xmalloc(new_len * sizeof(char *)) : NULL;
+  char **lines = (new_len != 0) ? xcalloc(new_len, sizeof(char *)) : NULL;
 
   for (size_t i = 0; i < new_len; i++) {
-    String l = replacement.items[i];
+    if (replacement.items[i].type != kObjectTypeString) {
+      api_set_error(err,
+                    Validation,
+                    _("All items in the replacement array must be strings"));
+      goto end;
+    }
+
+    String l = replacement.items[i].data.string;
     lines[i] = xmemdupz(l.data, l.size);
   }
 
@@ -191,7 +205,7 @@ void buffer_set_slice(Buffer buffer,
   switch_to_win_for_buf(buf, &save_curwin, &save_curtab, &save_curbuf);
 
   if (u_save((linenr_T)(start - 1), (linenr_T)end) == FAIL) {
-    set_api_error("Cannot save undo information", err);
+    api_set_error(err, Exception, _("Failed to save undo information"));
     goto end;
   }
 
@@ -201,7 +215,7 @@ void buffer_set_slice(Buffer buffer,
   size_t to_delete = (new_len < old_len) ? (size_t)(old_len - new_len) : 0;
   for (size_t i = 0; i < to_delete; i++) {
     if (ml_delete((linenr_T)start, false) == FAIL) {
-      set_api_error("Cannot delete line", err);
+      api_set_error(err, Exception, _("Failed to delete line"));
       goto end;
     }
   }
@@ -218,12 +232,12 @@ void buffer_set_slice(Buffer buffer,
     int64_t lnum = start + (int64_t)i;
 
     if (lnum > LONG_MAX) {
-      set_api_error("Index value is too high", err);
+      api_set_error(err, Validation, _("Index value is too high"));
       goto end;
     }
 
     if (ml_replace((linenr_T)lnum, (char_u *)lines[i], false) == FAIL) {
-      set_api_error("Cannot replace line", err);
+      api_set_error(err, Exception, _("Failed to replace line"));
       goto end;
     }
     // Mark lines that haven't been passed to the buffer as they need
@@ -236,12 +250,12 @@ void buffer_set_slice(Buffer buffer,
     int64_t lnum = start + (int64_t)i - 1;
 
     if (lnum > LONG_MAX) {
-      set_api_error("Index value is too high", err);
+      api_set_error(err, Validation, _("Index value is too high"));
       goto end;
     }
 
     if (ml_append((linenr_T)lnum, (char_u *)lines[i], 0, false) == FAIL) {
-      set_api_error("Cannot insert line", err);
+      api_set_error(err, Exception, _("Failed to insert line"));
       goto end;
     }
 
@@ -405,7 +419,7 @@ void buffer_set_name(Buffer buffer, String name, Error *err)
   }
 
   if (ren_ret == FAIL) {
-    set_api_error("failed to rename buffer", err);
+    api_set_error(err, Exception, _("Failed to rename buffer"));
   }
 }
 
@@ -415,7 +429,7 @@ void buffer_set_name(Buffer buffer, String name, Error *err)
 /// @return true if the buffer is valid, false otherwise
 Boolean buffer_is_valid(Buffer buffer)
 {
-  Error stub = {.set = false};
+  Error stub = ERROR_INIT;
   return find_buffer_by_handle(buffer, &stub) != NULL;
 }
 
@@ -426,9 +440,12 @@ Boolean buffer_is_valid(Buffer buffer)
 ///        to the end of the buffer.
 /// @param lines An array of lines
 /// @param[out] err Details of an error that may have occurred
-void buffer_insert(Buffer buffer, Integer lnum, StringArray lines, Error *err)
+void buffer_insert(Buffer buffer,
+                   Integer lnum,
+                   ArrayOf(String) lines,
+                   Error *err)
 {
-  buffer_set_slice(buffer, lnum, lnum, false, true, lines, err);
+  buffer_set_line_slice(buffer, lnum, lnum, false, true, lines, err);
 }
 
 /// Return a tuple (row,col) representing the position of the named mark
@@ -437,9 +454,9 @@ void buffer_insert(Buffer buffer, Integer lnum, StringArray lines, Error *err)
 /// @param name The mark's name
 /// @param[out] err Details of an error that may have occurred
 /// @return The (row, col) tuple
-Position buffer_get_mark(Buffer buffer, String name, Error *err)
+ArrayOf(Integer, 2) buffer_get_mark(Buffer buffer, String name, Error *err)
 {
-  Position rv = POSITION_INIT;
+  Array rv = ARRAY_DICT_INIT;
   buf_T *buf = find_buffer_by_handle(buffer, err);
 
   if (!buf) {
@@ -447,7 +464,7 @@ Position buffer_get_mark(Buffer buffer, String name, Error *err)
   }
 
   if (name.size != 1) {
-    set_api_error("mark name must be a single character", err);
+    api_set_error(err, Validation, _("Mark name must be a single character"));
     return rv;
   }
 
@@ -465,12 +482,13 @@ Position buffer_get_mark(Buffer buffer, String name, Error *err)
   }
 
   if (posp == NULL) {
-    set_api_error("invalid mark name", err);
+    api_set_error(err, Validation, _("Invalid mark name"));
     return rv;
   }
 
-  rv.row = posp->lnum;
-  rv.col = posp->col;
+  ADD(rv, INTEGER_OBJ(posp->lnum));
+  ADD(rv, INTEGER_OBJ(posp->col));
+
   return rv;
 }
 
@@ -486,7 +504,7 @@ static void switch_to_win_for_buf(buf_T *buf,
   win_T *wp;
   tabpage_T *tp;
 
-  if (find_win_for_buf(buf, &wp, &tp) == FAIL
+  if (!find_win_for_buf(buf, &wp, &tp)
       || switch_win(save_curwinp, save_curtabp, wp, tp, true) == FAIL)
     switch_buffer(save_curbufp, buf);
 }

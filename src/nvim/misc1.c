@@ -10,9 +10,13 @@
  * misc1.c: functions that didn't seem to fit elsewhere
  */
 
+#include <errno.h>
+#include <inttypes.h>
+#include <stdbool.h>
 #include <string.h>
 
 #include "nvim/vim.h"
+#include "nvim/ascii.h"
 #include "nvim/version_defs.h"
 #include "nvim/misc1.h"
 #include "nvim/charset.h"
@@ -48,6 +52,7 @@
 #include "nvim/strings.h"
 #include "nvim/tag.h"
 #include "nvim/term.h"
+#include "nvim/tempfile.h"
 #include "nvim/ui.h"
 #include "nvim/undo.h"
 #include "nvim/window.h"
@@ -58,7 +63,7 @@
 # include "misc1.c.generated.h"
 #endif
 /* All user names (for ~user completion as done by shell). */
-static garray_T ga_users;
+static garray_T ga_users = GA_EMPTY_INIT_VALUE;
 
 /*
  * open_line: Add a new line below or above the current line.
@@ -189,7 +194,7 @@ open_line (
     /*
      * count white space on current line
      */
-    newindent = get_indent_str(saved_line, (int)curbuf->b_p_ts);
+    newindent = get_indent_str(saved_line, (int)curbuf->b_p_ts, FALSE);
     if (newindent == 0 && !(flags & OPENLINE_COM_LIST))
       newindent = second_line_indent;       /* for ^^D command in insert mode */
 
@@ -498,7 +503,7 @@ open_line (
         break;
       }
     }
-    if (lead_len) {
+    if (lead_len > 0) {
       /* allocate buffer (may concatenate p_extra later) */
       leader = xmalloc(lead_len + lead_repl_len + extra_space + extra_len
           + (second_line_indent > 0 ? second_line_indent : 0) + 1);
@@ -626,7 +631,7 @@ open_line (
         if (curbuf->b_p_ai
             || do_si
             )
-          newindent = get_indent_str(leader, (int)curbuf->b_p_ts);
+          newindent = get_indent_str(leader, (int)curbuf->b_p_ts, FALSE);
 
         /* Add the indent offset */
         if (newindent + off < 0) {
@@ -732,7 +737,7 @@ open_line (
     p_extra = (char_u *)"";                 /* append empty line */
 
   /* concatenate leader and p_extra, if there is a leader */
-  if (lead_len) {
+  if (lead_len > 0) {
     if (flags & OPENLINE_COM_LIST && second_line_indent > 0) {
       int i;
       int padding = second_line_indent
@@ -1301,6 +1306,7 @@ int plines_win_col(win_T *wp, linenr_T lnum, long column)
   char_u      *s;
   int lines = 0;
   int width;
+  char_u *line;
 
   /* Check for filler lines above this buffer line.  When folded the result
    * is one line anyway. */
@@ -1312,11 +1318,11 @@ int plines_win_col(win_T *wp, linenr_T lnum, long column)
   if (wp->w_width == 0)
     return lines + 1;
 
-  s = ml_get_buf(wp->w_buffer, lnum, FALSE);
+  line = s = ml_get_buf(wp->w_buffer, lnum, FALSE);
 
   col = 0;
   while (*s != NUL && --column >= 0) {
-    col += win_lbr_chartabsize(wp, s, (colnr_T)col, NULL);
+    col += win_lbr_chartabsize(wp, line, s, (colnr_T)col, NULL);
     mb_ptr_adv(s);
   }
 
@@ -1328,7 +1334,7 @@ int plines_win_col(win_T *wp, linenr_T lnum, long column)
    * 'ts') -- webb.
    */
   if (*s == TAB && (State & NORMAL) && (!wp->w_p_list || lcs_tab1))
-    col += win_lbr_chartabsize(wp, s, (colnr_T)col, NULL) - 1;
+    col += win_lbr_chartabsize(wp, line, s, (colnr_T)col, NULL) - 1;
 
   /*
    * Add column offset for 'number', 'relativenumber', 'foldcolumn', etc.
@@ -1834,7 +1840,7 @@ void changed(void)
        * and don't let the emsg() set msg_scroll. */
       if (need_wait_return && emsg_silent == 0) {
         out_flush();
-        ui_delay(2000L, TRUE);
+        ui_delay(2000L, true);
         wait_return(TRUE);
         msg_scroll = save_msg_scroll;
       }
@@ -1871,16 +1877,16 @@ void changed_bytes(linenr_T lnum, colnr_T col)
 
   /* Diff highlighting in other diff windows may need to be updated too. */
   if (curwin->w_p_diff) {
-    win_T       *wp;
     linenr_T wlnum;
 
-    for (wp = firstwin; wp != NULL; wp = wp->w_next)
+    FOR_ALL_WINDOWS_IN_TAB(wp, curtab) {
       if (wp->w_p_diff && wp != curwin) {
         redraw_win_later(wp, VALID);
         wlnum = diff_lnum_win(lnum, wp);
         if (wlnum > 0)
           changedOneline(wp->w_buffer, wlnum);
       }
+    }
   }
 }
 
@@ -1967,17 +1973,18 @@ changed_lines (
     /* When the number of lines doesn't change then mark_adjust() isn't
      * called and other diff buffers still need to be marked for
      * displaying. */
-    win_T       *wp;
     linenr_T wlnum;
 
-    for (wp = firstwin; wp != NULL; wp = wp->w_next)
+    FOR_ALL_WINDOWS_IN_TAB(wp, curtab) {
       if (wp->w_p_diff && wp != curwin) {
         redraw_win_later(wp, VALID);
         wlnum = diff_lnum_win(lnum, wp);
-        if (wlnum > 0)
+        if (wlnum > 0) {
           changed_lines_buf(wp->w_buffer, wlnum,
               lnume - lnum + wlnum, 0L);
+        }
       }
+    }
   }
 
   changed_common(lnum, col, lnume, xtra);
@@ -2020,8 +2027,6 @@ changed_lines_buf (
  */
 static void changed_common(linenr_T lnum, colnr_T col, linenr_T lnume, long xtra)
 {
-  win_T       *wp;
-  tabpage_T   *tp;
   int i;
   int cols;
   pos_T       *p;
@@ -2065,21 +2070,21 @@ static void changed_common(linenr_T lnum, colnr_T col, linenr_T lnume, long xtra
           curbuf->b_changelistlen = JUMPLISTSIZE - 1;
           memmove(curbuf->b_changelist, curbuf->b_changelist + 1,
               sizeof(pos_T) * (JUMPLISTSIZE - 1));
-          FOR_ALL_TAB_WINDOWS(tp, wp)
-          {
+          FOR_ALL_TAB_WINDOWS(tp, wp) {
             /* Correct position in changelist for other windows on
              * this buffer. */
-            if (wp->w_buffer == curbuf && wp->w_changelistidx > 0)
+            if (wp->w_buffer == curbuf && wp->w_changelistidx > 0) {
               --wp->w_changelistidx;
+            }
           }
         }
-        FOR_ALL_TAB_WINDOWS(tp, wp)
-        {
+        FOR_ALL_TAB_WINDOWS(tp, wp) {
           /* For other windows, if the position in the changelist is
            * at the end it stays at the end. */
           if (wp->w_buffer == curbuf
-              && wp->w_changelistidx == curbuf->b_changelistlen)
+              && wp->w_changelistidx == curbuf->b_changelistlen) {
             ++wp->w_changelistidx;
+          }
         }
         ++curbuf->b_changelistlen;
       }
@@ -2091,8 +2096,7 @@ static void changed_common(linenr_T lnum, colnr_T col, linenr_T lnume, long xtra
     curwin->w_changelistidx = curbuf->b_changelistlen;
   }
 
-  FOR_ALL_TAB_WINDOWS(tp, wp)
-  {
+  FOR_ALL_TAB_WINDOWS(tp, wp) {
     if (wp->w_buffer == curbuf) {
       /* Mark this window to be redrawn later. */
       if (wp->w_redr_type < VALID)
@@ -2208,14 +2212,14 @@ unchanged (
  */
 void check_status(buf_T *buf)
 {
-  win_T       *wp;
-
-  for (wp = firstwin; wp != NULL; wp = wp->w_next)
+  FOR_ALL_WINDOWS_IN_TAB(wp, curtab) {
     if (wp->w_buffer == buf && wp->w_status_height) {
       wp->w_redr_status = TRUE;
-      if (must_redraw < VALID)
+      if (must_redraw < VALID) {
         must_redraw = VALID;
+      }
     }
+  }
 }
 
 /*
@@ -2257,7 +2261,7 @@ change_warning (
     (void)msg_end();
     if (msg_silent == 0 && !silent_mode) {
       out_flush();
-      ui_delay(1000L, TRUE);       /* give the user time to think about it */
+      ui_delay(1000L, true);       /* give the user time to think about it */
     }
     curbuf->b_did_warn = TRUE;
     redraw_cmdline = FALSE;     /* don't redraw and erase the message */
@@ -3324,8 +3328,6 @@ void prepare_to_exit(void)
  */
 void preserve_exit(void)
 {
-  buf_T       *buf;
-
   // Prevent repeated calls into this method.
   if (really_exiting) {
     exit(2);
@@ -3341,7 +3343,7 @@ void preserve_exit(void)
 
   ml_close_notmod();                /* close all not-modified buffers */
 
-  for (buf = firstbuf; buf != NULL; buf = buf->b_next) {
+  FOR_ALL_BUFFERS(buf) {
     if (buf->b_ml.ml_mfp != NULL && buf->b_ml.ml_mfp->mf_fname != NULL) {
       OUT_STR("Vim: preserving files...\n");
       screen_start();               /* don't know where cursor is now */
@@ -3399,13 +3401,16 @@ void fast_breakcheck(void)
 
 /*
  * Get the stdout of an external command.
+ * If "ret_len" is NULL replace NUL characters with NL.  When "ret_len" is not
+ * NULL store the length there.
  * Returns an allocated string, or NULL for error.
  */
 char_u *
 get_cmd_output (
     char_u *cmd,
     char_u *infile,            /* optional input file name */
-    int flags                      /* can be SHELL_SILENT */
+    int flags,                 // can be kShellOptSilent
+    size_t *ret_len
 )
 {
   char_u      *tempname;
@@ -3419,7 +3424,7 @@ get_cmd_output (
     return NULL;
 
   /* get a name for the temp file */
-  if ((tempname = vim_tempname('o')) == NULL) {
+  if ((tempname = vim_tempname()) == NULL) {
     EMSG(_(e_notmp));
     return NULL;
   }
@@ -3461,13 +3466,15 @@ get_cmd_output (
     EMSG2(_(e_notread), tempname);
     free(buffer);
     buffer = NULL;
-  } else {
+  } else if (ret_len == NULL) {
     /* Change NUL into SOH, otherwise the string is truncated. */
     for (i = 0; i < len; ++i)
       if (buffer[i] == NUL)
         buffer[i] = 1;
 
     buffer[len] = NUL;          /* make sure the buffer is terminated */
+  } else {
+    *ret_len = len;
   }
 
 done:

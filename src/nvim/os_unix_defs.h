@@ -24,10 +24,6 @@
 # include <unistd.h>
 #endif
 
-#ifdef HAVE_LIBC_H
-# include <libc.h>                  /* for NeXT */
-#endif
-
 #ifdef HAVE_SYS_PARAM_H
 # include <sys/param.h>     /* defines BSD, if it's a BSD system */
 #endif
@@ -41,17 +37,14 @@
 
 #ifdef SIGHASARG
 # ifdef SIGHAS3ARGS
-#  define SIGPROTOARG   (int, int, struct sigcontext *)
-#  define SIGDEFARG(s)  (s, sig2, scont) int s, sig2; struct sigcontext *scont;
+#  define SIGDEFARG(s)  (int s, int sig2, struct sigcontext *scont)
 #  define SIGDUMMYARG   0, 0, (struct sigcontext *)0
 # else
-#  define SIGPROTOARG   (int)
-#  define SIGDEFARG(s)  (s) int s;
+#  define SIGDEFARG(s)  (int s)
 #  define SIGDUMMYARG   0
 # endif
 #else
-# define SIGPROTOARG   (void)
-# define SIGDEFARG(s)  ()
+# define SIGDEFARG(s)  (void)
 # define SIGDUMMYARG
 #endif
 
@@ -207,9 +200,6 @@
   "~/.nvim,$VIM/vimfiles,$VIMRUNTIME,$VIM/vimfiles/after,~/.nvim/after"
 #  endif
 
-#  define TEMPDIRNAMES  "$TMPDIR", "/tmp", ".", "$HOME"
-#  define TEMPNAMELEN    256
-
 /* Special wildcards that need to be handled by the shell */
 #define SPECIAL_WILDCHAR    "`'{"
 
@@ -229,9 +219,6 @@
 # define MAXPATHL       1024
 #endif
 
-// TODO(stefan991): remove macro
-#define CHECK_INODE             /* used when checking if a swap file already
-                                    exists for a file */
 # ifndef DFLT_MAXMEM
 #  define DFLT_MAXMEM   (5*1024)         /* use up to 5 Mbyte for a buffer */
 # endif
@@ -263,17 +250,6 @@
 # include <string.h>
 #if defined(HAVE_STRINGS_H) && !defined(NO_STRINGS_WITH_STRING_H)
 # include <strings.h>
-#endif
-
-#include <setjmp.h>
-#ifdef HAVE_SIGSETJMP
-# define JMP_BUF sigjmp_buf
-# define SETJMP(x) sigsetjmp((x), 1)
-# define LONGJMP siglongjmp
-#else
-# define JMP_BUF jmp_buf
-# define SETJMP(x) setjmp(x)
-# define LONGJMP longjmp
 #endif
 
 #define HAVE_DUP                /* have dup() */

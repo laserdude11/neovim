@@ -2,7 +2,11 @@
 ///
 /// Popup menu (PUM)
 //
+#include <inttypes.h>
+#include <stdbool.h>
+
 #include "nvim/vim.h"
+#include "nvim/ascii.h"
 #include "nvim/popupmnu.h"
 #include "nvim/charset.h"
 #include "nvim/ex_cmds.h"
@@ -14,6 +18,7 @@
 #include "nvim/search.h"
 #include "nvim/strings.h"
 #include "nvim/window.h"
+#include "nvim/edit.h"
 
 static pumitem_T *pum_array = NULL; // items of displayed pum
 static int pum_size;                // nr of items in "pum_array"
@@ -536,7 +541,9 @@ static int pum_set_selected(int n, int repeat)
       if ((p_pvh > 0) && (p_pvh < g_do_tagpreview)) {
         g_do_tagpreview = p_pvh;
       }
-      resized = prepare_tagpreview(FALSE);
+      RedrawingDisabled++;
+      resized = prepare_tagpreview(false);
+      RedrawingDisabled--;
       g_do_tagpreview = 0;
 
       if (curwin->w_p_pvw) {
@@ -603,6 +610,13 @@ static int pum_set_selected(int n, int repeat)
           curwin->w_cursor.col = 0;
 
           if ((curwin != curwin_save) && win_valid(curwin_save)) {
+            // When the first completion is done and the preview
+            // window is not resized, skip the preview window's
+            // status line redrawing.
+            if (ins_compl_active() && !resized) {
+              curwin->w_redr_status = FALSE;
+            }
+
             // Return cursor to where we were
             validate_cursor();
             redraw_later(SOME_VALID);
@@ -612,7 +626,7 @@ static int pum_set_selected(int n, int repeat)
             // the window when needed, otherwise it will always be
             // redraw.
             if (resized) {
-              win_enter(curwin_save, TRUE);
+              win_enter(curwin_save, true);
               update_topline();
             }
 
@@ -623,7 +637,7 @@ static int pum_set_selected(int n, int repeat)
             pum_do_redraw = FALSE;
 
             if (!resized && win_valid(curwin_save)) {
-              win_enter(curwin_save, TRUE);
+              win_enter(curwin_save, true);
             }
 
             // May need to update the screen again when there are

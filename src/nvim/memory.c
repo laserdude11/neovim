@@ -1,6 +1,10 @@
  // Various routines dealing with allocation and deallocation of memory.
 
+#include <assert.h>
+#include <errno.h>
+#include <inttypes.h>
 #include <string.h>
+#include <stdbool.h>
 
 #include "nvim/vim.h"
 #include "nvim/misc2.h"
@@ -46,7 +50,7 @@
 
 /// Try to free memory. Used when trying to recover from out of memory errors.
 /// @see {xmalloc}
-static void try_to_free_memory()
+static void try_to_free_memory(void)
 {
   static bool trying_to_free = false;
   // avoid recursive calls
@@ -118,7 +122,8 @@ void *xmalloc(size_t size)
   void *ret = try_malloc(size);
 
   if (!ret) {
-    OUT_STR("Vim: Error: Out of memory.\n");
+    OUT_STR(e_outofmem);
+    out_char('\n');
     preserve_exit();
   }
   return ret;
@@ -144,7 +149,8 @@ void *xcalloc(size_t count, size_t size)
     if (!ret && (!count || !size))
       ret = calloc(1, 1);
     if (!ret) {
-      OUT_STR("Vim: Error: Out of memory.\n");
+      OUT_STR(e_outofmem);
+      out_char('\n');
       preserve_exit();
     }
   }
@@ -171,7 +177,8 @@ void *xrealloc(void *ptr, size_t size)
     if (!ret && !size)
       ret = realloc(ptr, 1);
     if (!ret) {
-      OUT_STR("Vim: Error: Out of memory.\n");
+      OUT_STR(e_outofmem);
+      out_char('\n');
       preserve_exit();
     }
   }
@@ -191,7 +198,7 @@ void *xmallocz(size_t size)
   void *ret;
 
   if (total_size < size) {
-    OUT_STR("Vim: Data too large to fit into virtual memory space\n");
+    OUT_STR(_("Vim: Data too large to fit into virtual memory space\n"));
     preserve_exit();
   }
 
@@ -214,6 +221,66 @@ void *xmemdupz(const void *data, size_t len)
   FUNC_ATTR_NONNULL_ALL
 {
   return memcpy(xmallocz(len), data, len);
+}
+
+/// A version of strchr() that returns a pointer to the terminating NUL if it
+/// doesn't find `c`.
+///
+/// @param str The string to search.
+/// @param c   The char to look for.
+/// @returns a pointer to the first instance of `c`, or to the NUL terminator
+///          if not found.
+char *xstrchrnul(const char *str, char c)
+  FUNC_ATTR_NONNULL_RET FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE
+{
+  char *p = strchr(str, c);
+  return p ? p : (char *)(str + strlen(str));
+}
+
+/// A version of memchr() that returns a pointer one past the end
+/// if it doesn't find `c`.
+///
+/// @param addr The address of the memory object.
+/// @param c    The char to look for.
+/// @param size The size of the memory object.
+/// @returns a pointer to the first instance of `c`, or one past the end if not
+///          found.
+void *xmemscan(const void *addr, char c, size_t size)
+  FUNC_ATTR_NONNULL_RET FUNC_ATTR_NONNULL_ALL FUNC_ATTR_PURE
+{
+  char *p = memchr(addr, c, size);
+  return p ? p : (char *)addr + size;
+}
+
+/// Replaces every instance of `c` with `x`.
+///
+/// @warning Will read past `str + strlen(str)` if `c == NUL`.
+///
+/// @param str A NUL-terminated string.
+/// @param c   The unwanted byte.
+/// @param x   The replacement.
+void strchrsub(char *str, char c, char x)
+  FUNC_ATTR_NONNULL_ALL
+{
+  assert(c != '\0');
+  while ((str = strchr(str, c))) {
+    *str++ = x;
+  }
+}
+
+/// Replaces every instance of `c` with `x`.
+///
+/// @param data An object in memory. May contain NULs.
+/// @param c    The unwanted byte.
+/// @param x    The replacement.
+/// @param len  The length of data.
+void memchrsub(void *data, char c, char x, size_t len)
+  FUNC_ATTR_NONNULL_ALL
+{
+  char *p = data, *end = (char *)data + len;
+  while ((p = memchr(p, c, (size_t)(end - p)))) {
+    *p++ = x;
+  }
 }
 
 /// The xstpcpy() function shall copy the string pointed to by src (including
@@ -313,7 +380,8 @@ char *xstrdup(const char *str)
     try_to_free_memory();
     ret = strdup(str);
     if (!ret) {
-      OUT_STR("Vim: Error: Out of memory.\n");
+      OUT_STR(e_outofmem);
+      out_char('\n');
       preserve_exit();
     }
   }
@@ -376,13 +444,13 @@ void do_outofmem_msg(size_t size)
 void free_all_mem(void)
 {
   buf_T       *buf, *nextbuf;
-  static int entered = FALSE;
+  static bool entered = false;
 
   /* When we cause a crash here it is caught and Vim tries to exit cleanly.
    * Don't try freeing everything again. */
   if (entered)
     return;
-  entered = TRUE;
+  entered = true;
 
   block_autocmds();         /* don't want to trigger autocommands here */
 
@@ -445,13 +513,9 @@ void free_all_mem(void)
   p_hi = 0;
   init_history();
 
-  {
-    win_T       *win;
-    tabpage_T   *tab;
-
-    qf_free_all(NULL);
-    /* Free all location lists */
-    FOR_ALL_TAB_WINDOWS(tab, win)
+  qf_free_all(NULL);
+  /* Free all location lists */
+  FOR_ALL_TAB_WINDOWS(tab, win) {
     qf_free_all(win);
   }
 
@@ -507,8 +571,6 @@ void free_all_mem(void)
   free_screenlines();
 
   clear_hl_tables();
-
-  free(NameBuff);
 }
 
 #endif

@@ -1,11 +1,6 @@
 cmake_minimum_required (VERSION 2.8.7)
 project (NEOVIM)
 
-set(CMAKE_SYSTEM_PROCESSOR i386)
-set(CMAKE_SYSTEM_LIBRARY_PATH /lib32 /usr/lib32 /usr/local/lib32)
-set(FIND_LIBRARY_USE_LIB64_PATHS OFF)
-set(CMAKE_IGNORE_PATH /lib /usr/lib /usr/local/lib)
-
 # Point CMake at any custom modules we may ship
 set(CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
 
@@ -17,13 +12,33 @@ set(DEPS_BIN_DIR "${DEPS_INSTALL_DIR}/bin")
 
 list(APPEND CMAKE_PREFIX_PATH ${DEPS_INSTALL_DIR})
 
-set(NEOVIM_VERSION_MAJOR 0)
-set(NEOVIM_VERSION_MINOR 0)
-set(NEOVIM_VERSION_PATCH 0)
+# Version tokens
+include(GetGitRevisionDescription)
+get_git_head_revision(GIT_REFSPEC NVIM_VERSION_COMMIT)
+set(NVIM_VERSION_MAJOR 0)
+set(NVIM_VERSION_MINOR 0)
+set(NVIM_VERSION_PATCH 0)
+set(NVIM_VERSION_PRERELEASE "-alpha")
+# TODO(justinmk): UTC time would be nice here #1071
+git_timestamp(GIT_TIMESTAMP)
+# TODO(justinmk): do not set this for "release" builds #1071
+set(NVIM_VERSION_BUILD "+${GIT_TIMESTAMP}")
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-add_definitions(-Wall -Wextra -pedantic -Wno-unused-parameter -std=gnu99)
+# Work around some old, broken detection by CMake for knowing when to use the
+# isystem flag.  Apple's compilers have supported this for quite some time now.
+if(APPLE)
+  if(CMAKE_COMPILER_IS_GNUCC)
+    set(CMAKE_INCLUDE_SYSTEM_FLAG_C "-isystem ")
+  endif()
+  if(CMAKE_COMPILER_IS_GNUCXX)
+    set(CMAKE_INCLUDE_SYSTEM_FLAG_CXX "-isystem ")
+  endif()
+endif()
+
+add_definitions(-Wall -Wextra -pedantic -Wno-unused-parameter
+    -Wstrict-prototypes -std=gnu99)
 
 option(
   TRAVIS_CI_BUILD "Travis CI build.  Extra compilation flags will be set." OFF)
@@ -79,53 +94,46 @@ if(LibIntl_FOUND)
 endif()
 
 # Determine platform's threading library. Set CMAKE_THREAD_PREFER_PTHREAD
-# explicitly to indicate a strong preference for pthread. It is an error to not
-# have pthread installed even if, for example, the Win32 threading API is found.
+# explicitly to indicate a strong preference for pthread.
 set(CMAKE_THREAD_PREFER_PTHREAD ON)
 find_package(Threads REQUIRED)
-if(NOT CMAKE_USE_PTHREADS_INIT)
-  message(SEND_ERROR "The pthread library must be installed on your system.")
-endif(NOT CMAKE_USE_PTHREADS_INIT)
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
-find_program(LUA_PRG luajit)
+# Find Lua interpreter
+include(LuaHelpers)
+set(LUA_DEPENDENCIES lpeg MessagePack bit)
+if(NOT LUA_PRG)
+  foreach(CURRENT_LUA_PRG luajit lua)
+    # If LUA_PRG is set find_program() will not search
+    unset(LUA_PRG CACHE)
+    unset(LUA_PRG_WORKS)
+    find_program(LUA_PRG ${CURRENT_LUA_PRG})
 
-# Need a lua interpreter for running the msgapck metadata/dispatch generator
-if(NOT EXISTS ${LUA_PRG})
-  find_program(LUA_PRG lua)
-endif()
-
-if(EXISTS ${LUA_PRG})
-  message(STATUS "Using the lua interpreter ${LUA_PRG}")
+    if(LUA_PRG)
+      check_lua_deps(${LUA_PRG} "${LUA_DEPENDENCIES}" LUA_PRG_WORKS)
+      if(LUA_PRG_WORKS)
+        break()
+      endif()
+    endif()
+  endforeach()
 else()
-  message(FATAL_ERROR "A lua interpreter is required for building the Neovim")
+  check_lua_deps(${LUA_PRG} "${LUA_DEPENDENCIES}" LUA_PRG_WORKS)
 endif()
 
-execute_process(COMMAND ${LUA_PRG} -e "require('lpeg')"
-                RESULT_VARIABLE LUA_LPEG_MISSING
-                ERROR_QUIET)
-
-if(${LUA_LPEG_MISSING})
-  message(FATAL_ERROR
-          "The 'lpeg' lua package is required for building Neovim")
+if(NOT LUA_PRG_WORKS)
+  message(FATAL_ERROR "A suitable Lua interpreter was not found")
 endif()
 
-execute_process(COMMAND ${LUA_PRG} -e "require('cmsgpack')"
-                RESULT_VARIABLE LUA_MSGPACK_MISSING
-                ERROR_QUIET)
+message(STATUS "Using the Lua interpreter ${LUA_PRG}")
 
-if(${LUA_MSGPACK_MISSING})
-  message(FATAL_ERROR
-         "The 'cmsgpack' lua package is required for building Neovim")
-endif()
-
-add_subdirectory(config)
-add_subdirectory(src/nvim)
-add_subdirectory(test/includes)
-
+# Setup busted.
 find_program(BUSTED_PRG busted)
+if(NOT BUSTED_OUTPUT_TYPE)
+  set(BUSTED_OUTPUT_TYPE "utfTerminal")
+endif()
 
+# Setup make.
 find_program(MAKE_PRG NAMES gmake make)
 if(MAKE_PRG)
   execute_process(
@@ -147,13 +155,56 @@ if(CMAKE_GENERATOR MATCHES "Makefiles")
   set(MAKE_PRG "$(MAKE)")
 endif()
 
-if(NOT BUSTED_OUTPUT_TYPE)
-  set(BUSTED_OUTPUT_TYPE "utf_terminal")
-endif()
+# CMake is painful here.  It will create the destination using the user's
+# current umask, and we don't want that.  And we don't just want to install
+# the target directory, as it will mess with existing permissions.  So this
+# seems like the best compromise.  If we create it, then everyone can see it.
+# If it's preexisting, leave it alone.
+include(InstallHelpers)
 
+install_helper(
+  DIRECTORY runtime
+  DESTINATION share/nvim)
+
+file(GLOB_RECURSE RUNTIME_PROGRAMS
+  RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}
+  runtime/*.pl runtime/*.awk runtime/*.sh
+  runtime/tools/ref
+  runtime/tools/vimm)
+
+foreach(PROG ${RUNTIME_PROGRAMS})
+  get_filename_component(BASEDIR ${PROG} PATH)
+  install_helper(PROGRAMS ${PROG} DESTINATION share/nvim/${BASEDIR})
+endforeach()
+
+install(SCRIPT ${CMAKE_MODULE_PATH}/GenerateHelptags.cmake)
+
+# Unfortunately, the below does not work under Ninja.  Ninja doesn't use a
+# pseudo-tty when launching processes, because it can put many jobs in parallel
+# and eat-up all the available pseudo-ttys.  Unfortunately, that doesn't work
+# well with the legacy tests.  I have a branch that converts them to run under
+# CTest, but it needs a little more work.
+# add_custom_target(test
+#   COMMAND ${MAKE_PRG} -C ${CMAKE_CURRENT_SOURCE_DIR}/src/nvim/testdir
+#     VIMPROG=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/nvim)
+
+# Go down the tree.
+
+add_subdirectory(config)
+add_subdirectory(src/nvim)
+add_subdirectory(test/includes)
+
+# Setup some test-related bits.  We do this after going down the tree because we
+# need some of the targets.
 if(BUSTED_PRG)
   get_property(TEST_INCLUDE_DIRS DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     PROPERTY INCLUDE_DIRECTORIES)
+
+  # Set policy CMP0026 to OLD so we avoid CMake warnings on newer
+  # versions of cmake.
+  if(POLICY CMP0026)
+    cmake_policy(SET CMP0026 OLD)
+  endif()
   get_target_property(TEST_LIBNVIM_PATH nvim-test LOCATION)
 
   configure_file(
@@ -168,15 +219,26 @@ if(BUSTED_PRG)
       -DBUSTED_OUTPUT_TYPE=${BUSTED_OUTPUT_TYPE}
       -DTEST_DIR=${CMAKE_CURRENT_SOURCE_DIR}/test
       -DBUILD_DIR=${CMAKE_BINARY_DIR}
-      -P ${CMAKE_MODULE_PATH}/RunUnittests.cmake
+      -DTEST_TYPE=unit
+      -P ${CMAKE_MODULE_PATH}/RunTests.cmake
     DEPENDS nvim-test unittest-headers)
-endif()
 
-# Unfortunately, the below does not work under Ninja.  Ninja doesn't use a
-# pseudo-tty when launching processes, because it can put many jobs in parallel
-# and eat-up all the available pseudo-ttys.  Unfortunately, that doesn't work
-# well with the legacy tests.  I have a branch that converts them to run under
-# CTest, but it needs a little more work.
-# add_custom_target(test
-#   COMMAND ${MAKE_PRG} -C ${CMAKE_CURRENT_SOURCE_DIR}/src/nvim/testdir
-#     VIMPROG=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/nvim)
+  # For the functional tests we need the full path to the real busted script,
+  # which will be included by run-functional-tests.py.
+  get_filename_component(LUA_PRG_DIR ${LUA_PRG} PATH)
+  get_filename_component(LUA_PREFIX_DIR ${LUA_PRG_DIR} PATH)
+  file(GLOB_RECURSE BUSTED_REAL_PRG
+    ${LUA_PREFIX_DIR}/lib/luarocks/rocks/busted/*busted)
+
+  add_custom_target(test
+    COMMAND ${CMAKE_COMMAND}
+      -DBUSTED_PRG=${PROJECT_SOURCE_DIR}/scripts/run-functional-tests.py
+      -DBUSTED_REAL_PRG=${BUSTED_REAL_PRG}
+      -DWORKING_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+      -DBUSTED_OUTPUT_TYPE=${BUSTED_OUTPUT_TYPE}
+      -DTEST_DIR=${CMAKE_CURRENT_SOURCE_DIR}/test
+      -DBUILD_DIR=${CMAKE_BINARY_DIR}
+      -DTEST_TYPE=functional
+      -P ${CMAKE_MODULE_PATH}/RunTests.cmake
+    DEPENDS nvim) 
+endif()

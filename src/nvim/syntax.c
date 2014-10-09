@@ -10,10 +10,15 @@
  * syntax.c: code for syntax highlighting
  */
 
+#include <assert.h>
+#include <errno.h>
+#include <inttypes.h>
+#include <stdbool.h>
 #include <string.h>
 #include <stdlib.h>
 
 #include "nvim/vim.h"
+#include "nvim/ascii.h"
 #include "nvim/syntax.h"
 #include "nvim/charset.h"
 #include "nvim/eval.h"
@@ -37,6 +42,7 @@
 #include "nvim/regexp.h"
 #include "nvim/screen.h"
 #include "nvim/strings.h"
+#include "nvim/syntax_defs.h"
 #include "nvim/term.h"
 #include "nvim/ui.h"
 #include "nvim/os/os.h"
@@ -75,7 +81,8 @@ struct hl_group {
 #define SG_GUI          4       /* gui has been set */
 #define SG_LINK         8       /* link has been set */
 
-static garray_T highlight_ga;   /* highlight groups for 'highlight' option */
+// highlight groups for 'highlight' option
+static garray_T highlight_ga = GA_EMPTY_INIT_VALUE;
 
 #define HL_TABLE() ((struct hl_group *)((highlight_ga.ga_data)))
 
@@ -360,7 +367,7 @@ static int current_state_stored = 0;      /* TRUE if stored current state
                                            * after setting current_finished */
 static int current_finished = 0;        /* current line has been finished */
 static garray_T current_state           /* current stack of state_items */
-  = {0, 0, 0, 0, NULL};
+  = GA_EMPTY_INIT_VALUE;
 static short    *current_next_list = NULL; /* when non-zero, nextgroup list */
 static int current_next_flags = 0;      /* flags for current_next_list */
 static int current_line_id = 0;         /* unique number for current line */
@@ -977,16 +984,13 @@ static void syn_stack_free_block(synblock_T *block)
  */
 void syn_stack_free_all(synblock_T *block)
 {
-  win_T       *wp;
-
   syn_stack_free_block(block);
 
-
   /* When using "syntax" fold method, must update all folds. */
-  FOR_ALL_WINDOWS(wp)
-  {
-    if (wp->w_s == block && foldmethodIsSyntax(wp))
+  FOR_ALL_WINDOWS_IN_TAB(wp, curtab) {
+    if (wp->w_s == block && foldmethodIsSyntax(wp)) {
       foldUpdateAll(wp);
+    }
   }
 }
 
@@ -1068,14 +1072,12 @@ static void syn_stack_alloc(void)
  */
 void syn_stack_apply_changes(buf_T *buf)
 {
-  win_T       *wp;
-
   syn_stack_apply_changes_block(&buf->b_s, buf);
 
-  FOR_ALL_WINDOWS(wp)
-  {
-    if ((wp->w_buffer == buf) && (wp->w_s != &buf->b_s))
+  FOR_ALL_WINDOWS_IN_TAB(wp, curtab) {
+    if ((wp->w_buffer == buf) && (wp->w_s != &buf->b_s)) {
       syn_stack_apply_changes_block(wp->w_s, buf);
+    }
   }
 }
 
@@ -1452,7 +1454,7 @@ static void invalidate_current_state(void)
 static void validate_current_state(void)
 {
   current_state.ga_itemsize = sizeof(stateitem_T);
-  current_state.ga_growsize = 3;
+  ga_set_growsize(&current_state, 3);
 }
 
 /*
@@ -1556,7 +1558,7 @@ syn_finish_line (
 int 
 get_syntax_attr (
     colnr_T col,
-    int *can_spell,
+    bool *can_spell,
     int keep_state                 /* keep state of char at "col" */
 )
 {
@@ -1603,9 +1605,9 @@ get_syntax_attr (
  */
 static int 
 syn_current_attr (
-    int syncing,                            /* When 1: called for syncing */
-    int displaying,                         /* result will be displayed */
-    int *can_spell,                 /* return: do spell checking */
+    int syncing,                           /* When 1: called for syncing */
+    int displaying,                        /* result will be displayed */
+    bool *can_spell,                       /* return: do spell checking */
     int keep_state                         /* keep syntax stack afterwards */
 )
 {
@@ -1962,9 +1964,7 @@ syn_current_attr (
             /* Add the index to a list, so that we can check
              * later that we don't match it again (and cause an
              * endless loop). */
-            ga_grow(&zero_width_next_ga, 1);
-            ((int *)(zero_width_next_ga.ga_data))
-            [zero_width_next_ga.ga_len++] = next_match_idx;
+            GA_APPEND(int, &zero_width_next_ga, next_match_idx);
             next_match_idx = -1;
           } else
             cur_si = push_next_match(cur_si);
@@ -2070,7 +2070,7 @@ syn_current_attr (
           if (syn_block->b_nospell_cluster_id != 0) {
             sps.id = syn_block->b_nospell_cluster_id;
             if (in_id_list(sip, sip->si_cont_list, &sps, 0))
-              *can_spell = FALSE;
+              *can_spell = false;
           }
         }
       }
@@ -2486,10 +2486,9 @@ update_si_end (
  */
 static void push_current_state(int idx)
 {
-  ga_grow(&current_state, 1);
-  memset(&CUR_STATE(current_state.ga_len), 0, sizeof(stateitem_T));
-  CUR_STATE(current_state.ga_len).si_idx = idx;
-  ++current_state.ga_len;
+  stateitem_T *p = GA_APPEND_VIA_PTR(stateitem_T, &current_state);
+  memset(p, 0, sizeof(*p));
+  p->si_idx = idx;
 }
 
 /*
@@ -2853,17 +2852,19 @@ static int syn_regexec(regmmatch_T *rmp, linenr_T lnum, colnr_T col, syn_time_T 
   int r;
   proftime_T pt;
 
-  if (syn_time_on)
-    profile_start(&pt);
+  if (syn_time_on) {
+    pt = profile_start();
+  }
 
   rmp->rmm_maxcol = syn_buf->b_p_smc;
   r = vim_regexec_multi(rmp, syn_win, syn_buf, lnum, col, NULL);
 
   if (syn_time_on) {
-    profile_end(&pt);
-    profile_add(&st->total, &pt);
-    if (profile_cmp(&pt, &st->slowest) < 0)
+    pt = profile_end(pt);
+    st->total = profile_add(st->total, pt);
+    if (profile_cmp(pt, st->slowest) < 0) {
       st->slowest = pt;
+    }
     ++st->count;
     if (r > 0)
       ++st->match;
@@ -4280,28 +4281,26 @@ syn_cmd_match (
     if (!ends_excmd(*rest) || eap->skip)
       rest = NULL;
     else {
-      ga_grow(&curwin->w_s->b_syn_patterns, 1);
       if ((syn_id = syn_check_group(arg, (int)(group_name_end - arg))) != 0) {
         syn_incl_toplevel(syn_id, &syn_opt_arg.flags);
         /*
          * Store the pattern in the syn_items list
          */
-        int idx = curwin->w_s->b_syn_patterns.ga_len;
-        SYN_ITEMS(curwin->w_s)[idx] = item;
-        SYN_ITEMS(curwin->w_s)[idx].sp_syncing = syncing;
-        SYN_ITEMS(curwin->w_s)[idx].sp_type = SPTYPE_MATCH;
-        SYN_ITEMS(curwin->w_s)[idx].sp_syn.id = syn_id;
-        SYN_ITEMS(curwin->w_s)[idx].sp_syn.inc_tag = current_syn_inc_tag;
-        SYN_ITEMS(curwin->w_s)[idx].sp_flags = syn_opt_arg.flags;
-        SYN_ITEMS(curwin->w_s)[idx].sp_sync_idx = sync_idx;
-        SYN_ITEMS(curwin->w_s)[idx].sp_cont_list = syn_opt_arg.cont_list;
-        SYN_ITEMS(curwin->w_s)[idx].sp_syn.cont_in_list =
-          syn_opt_arg.cont_in_list;
-        SYN_ITEMS(curwin->w_s)[idx].sp_cchar = conceal_char;
+        synpat_T *spp = GA_APPEND_VIA_PTR(synpat_T,
+                                          &curwin->w_s->b_syn_patterns);
+        *spp = item;
+        spp->sp_syncing = syncing;
+        spp->sp_type = SPTYPE_MATCH;
+        spp->sp_syn.id = syn_id;
+        spp->sp_syn.inc_tag = current_syn_inc_tag;
+        spp->sp_flags = syn_opt_arg.flags;
+        spp->sp_sync_idx = sync_idx;
+        spp->sp_cont_list = syn_opt_arg.cont_list;
+        spp->sp_syn.cont_in_list = syn_opt_arg.cont_in_list;
+        spp->sp_cchar = conceal_char;
         if (syn_opt_arg.cont_in_list != NULL)
           curwin->w_s->b_syn_containedin = TRUE;
-        SYN_ITEMS(curwin->w_s)[idx].sp_next_list = syn_opt_arg.next_list;
-        ++curwin->w_s->b_syn_patterns.ga_len;
+        spp->sp_next_list = syn_opt_arg.next_list;
 
         /* remember that we found a match for syncing on */
         if (syn_opt_arg.flags & (HL_SYNC_HERE|HL_SYNC_THERE))
@@ -4746,7 +4745,7 @@ static int syn_add_cluster(char_u *name)
    */
   if (curwin->w_s->b_syn_clusters.ga_data == NULL) {
     curwin->w_s->b_syn_clusters.ga_itemsize = sizeof(syn_cluster_T);
-    curwin->w_s->b_syn_clusters.ga_growsize = 10;
+    ga_set_growsize(&curwin->w_s->b_syn_clusters, 10);
   }
 
   int len = curwin->w_s->b_syn_clusters.ga_len;
@@ -4756,16 +4755,12 @@ static int syn_add_cluster(char_u *name)
     return 0;
   }
 
-  /*
-   * Make room for at least one other cluster entry.
-   */
-  ga_grow(&curwin->w_s->b_syn_clusters, 1);
-
-  memset(&(SYN_CLSTR(curwin->w_s)[len]), 0, sizeof(syn_cluster_T));
-  SYN_CLSTR(curwin->w_s)[len].scl_name = name;
-  SYN_CLSTR(curwin->w_s)[len].scl_name_u = vim_strsave_up(name);
-  SYN_CLSTR(curwin->w_s)[len].scl_list = NULL;
-  ++curwin->w_s->b_syn_clusters.ga_len;
+  syn_cluster_T *scp = GA_APPEND_VIA_PTR(syn_cluster_T,
+                                         &curwin->w_s->b_syn_clusters);
+  memset(scp, 0, sizeof(*scp));
+  scp->scl_name = name;
+  scp->scl_name_u = vim_strsave_up(name);
+  scp->scl_list = NULL;
 
   if (STRICMP(name, "Spell") == 0)
     curwin->w_s->b_spell_cluster_id = len + SYNID_CLUSTER;
@@ -4846,7 +4841,7 @@ static void syn_cmd_cluster(exarg_T *eap, int syncing)
 static void init_syn_patterns(void)
 {
   curwin->w_s->b_syn_patterns.ga_itemsize = sizeof(synpat_T);
-  curwin->w_s->b_syn_patterns.ga_growsize = 10;
+  ga_set_growsize(&curwin->w_s->b_syn_patterns, 10);
 }
 
 /*
@@ -5535,8 +5530,8 @@ syn_get_id (
     win_T *wp,
     long lnum,
     colnr_T col,
-    int trans,                   /* remove transparency */
-    int *spellp,         /* return: can do spell checking */
+    int trans,                  /* remove transparency */
+    bool *spellp,               /* return: can do spell checking */
     int keep_state              /* keep state of char at "col" */
 )
 {
@@ -5633,8 +5628,8 @@ void ex_syntime(exarg_T *eap)
 
 static void syn_clear_time(syn_time_T *st)
 {
-  profile_zero(&st->total);
-  profile_zero(&st->slowest);
+  st->total = profile_zero();
+  st->slowest = profile_zero();
   st->count = 0;
   st->match = 0;
 }
@@ -5676,7 +5671,7 @@ static int syn_compare_syntime(const void *v1, const void *v2)
   const time_entry_T  *s1 = v1;
   const time_entry_T  *s2 = v2;
 
-  return profile_cmp(&s1->total, &s2->total);
+  return profile_cmp(s1->total, s2->total);
 }
 
 /*
@@ -5684,37 +5679,31 @@ static int syn_compare_syntime(const void *v1, const void *v2)
  */
 static void syntime_report(void)
 {
-  synpat_T    *spp;
-  proftime_T tm;
-  int len;
-  proftime_T total_total;
-  int total_count = 0;
-  garray_T ga;
-  time_entry_T *p;
-
   if (!syntax_present(curwin)) {
     MSG(_(msg_no_items));
     return;
   }
 
+  garray_T ga;
   ga_init(&ga, sizeof(time_entry_T), 50);
-  profile_zero(&total_total);
+
+  proftime_T total_total = profile_zero();
+  int total_count = 0;
+  time_entry_T *p;
   for (int idx = 0; idx < curwin->w_s->b_syn_patterns.ga_len; ++idx) {
-    spp = &(SYN_ITEMS(curwin->w_s)[idx]);
+    synpat_T *spp = &(SYN_ITEMS(curwin->w_s)[idx]);
     if (spp->sp_time.count > 0) {
-      ga_grow(&ga, 1);
-      p = ((time_entry_T *)ga.ga_data) + ga.ga_len;
+      p = GA_APPEND_VIA_PTR(time_entry_T, &ga);
       p->total = spp->sp_time.total;
-      profile_add(&total_total, &spp->sp_time.total);
+      total_total = profile_add(total_total, spp->sp_time.total);
       p->count = spp->sp_time.count;
       p->match = spp->sp_time.match;
       total_count += spp->sp_time.count;
       p->slowest = spp->sp_time.slowest;
-      profile_divide(&spp->sp_time.total, spp->sp_time.count, &tm);
+      proftime_T tm = profile_divide(spp->sp_time.total, spp->sp_time.count);
       p->average = tm;
       p->id = spp->sp_syn.id;
       p->pattern = spp->sp_pattern;
-      ++ga.ga_len;
     }
   }
 
@@ -5726,10 +5715,9 @@ static void syntime_report(void)
           "  TOTAL      COUNT  MATCH   SLOWEST     AVERAGE   NAME               PATTERN"));
   MSG_PUTS("\n");
   for (int idx = 0; idx < ga.ga_len && !got_int; ++idx) {
-    spp = &(SYN_ITEMS(curwin->w_s)[idx]);
     p = ((time_entry_T *)ga.ga_data) + idx;
 
-    MSG_PUTS(profile_msg(&p->total));
+    MSG_PUTS(profile_msg(p->total));
     MSG_PUTS(" ");     /* make sure there is always a separating space */
     msg_advance(13);
     msg_outnum(p->count);
@@ -5738,16 +5726,17 @@ static void syntime_report(void)
     msg_outnum(p->match);
     MSG_PUTS(" ");
     msg_advance(26);
-    MSG_PUTS(profile_msg(&p->slowest));
+    MSG_PUTS(profile_msg(p->slowest));
     MSG_PUTS(" ");
     msg_advance(38);
-    MSG_PUTS(profile_msg(&p->average));
+    MSG_PUTS(profile_msg(p->average));
     MSG_PUTS(" ");
     msg_advance(50);
     msg_outtrans(HL_TABLE()[p->id - 1].sg_name);
     MSG_PUTS(" ");
 
     msg_advance(69);
+    int len;
     if (Columns < 80)
       len = 20;       /* will wrap anyway */
     else
@@ -5760,7 +5749,7 @@ static void syntime_report(void)
   ga_clear(&ga);
   if (!got_int) {
     MSG_PUTS("\n");
-    MSG_PUTS(profile_msg(&total_total));
+    MSG_PUTS(profile_msg(total_total));
     msg_advance(13);
     msg_outnum(total_count);
     MSG_PUTS("\n");
@@ -6693,6 +6682,8 @@ static int hl_has_settings(int idx, int check_link)
 {
   return HL_TABLE()[idx].sg_term_attr != 0
          || HL_TABLE()[idx].sg_cterm_attr != 0
+         || HL_TABLE()[idx].sg_cterm_fg != 0
+         || HL_TABLE()[idx].sg_cterm_bg != 0
          || (check_link && (HL_TABLE()[idx].sg_set & SG_LINK));
 }
 
@@ -6731,11 +6722,11 @@ static void highlight_clear(int idx)
  * Note that this table is used by ALL buffers.  This is required because the
  * GUI can redraw at any time for any buffer.
  */
-static garray_T term_attr_table = {0, 0, 0, 0, NULL};
+static garray_T term_attr_table = GA_EMPTY_INIT_VALUE;
 
 #define TERM_ATTR_ENTRY(idx) ((attrentry_T *)term_attr_table.ga_data)[idx]
 
-static garray_T cterm_attr_table = {0, 0, 0, 0, NULL};
+static garray_T cterm_attr_table = GA_EMPTY_INIT_VALUE;
 
 #define CTERM_ATTR_ENTRY(idx) ((attrentry_T *)cterm_attr_table.ga_data)[idx]
 
@@ -6755,7 +6746,7 @@ static int get_attr_entry(garray_T *table, attrentry_T *aep)
    * Init the table, in case it wasn't done yet.
    */
   table->ga_itemsize = sizeof(attrentry_T);
-  table->ga_growsize = 7;
+  ga_set_growsize(table, 7);
 
   /*
    * Try to find an entry with the same specifications.
@@ -6811,10 +6802,8 @@ static int get_attr_entry(garray_T *table, attrentry_T *aep)
   /*
    * This is a new combination of colors and font, add an entry.
    */
-  ga_grow(table, 1);
-
-  taep = &(((attrentry_T *)table->ga_data)[table->ga_len]);
-  memset(taep, 0, sizeof(attrentry_T));
+  taep = GA_APPEND_VIA_PTR(attrentry_T, table);
+  memset(taep, 0, sizeof(*taep));
   taep->ae_attr = aep->ae_attr;
   if (table == &term_attr_table) {
     if (aep->ae_u.term.start == NULL)
@@ -6829,7 +6818,7 @@ static int get_attr_entry(garray_T *table, attrentry_T *aep)
     taep->ae_u.cterm.fg_color = aep->ae_u.cterm.fg_color;
     taep->ae_u.cterm.bg_color = aep->ae_u.cterm.bg_color;
   }
-  ++table->ga_len;
+
   return table->ga_len - 1 + ATTR_OFF;
 }
 
@@ -7311,7 +7300,7 @@ static int syn_add_group(char_u *name)
    */
   if (highlight_ga.ga_data == NULL) {
     highlight_ga.ga_itemsize = sizeof(struct hl_group);
-    highlight_ga.ga_growsize = 10;
+    ga_set_growsize(&highlight_ga, 10);
   }
 
   if (highlight_ga.ga_len >= MAX_HL_ID) {
@@ -7320,15 +7309,11 @@ static int syn_add_group(char_u *name)
     return 0;
   }
 
-  /*
-   * Make room for at least one other syntax_highlight entry.
-   */
-  ga_grow(&highlight_ga, 1);
-
-  memset(&(HL_TABLE()[highlight_ga.ga_len]), 0, sizeof(struct hl_group));
-  HL_TABLE()[highlight_ga.ga_len].sg_name = name;
-  HL_TABLE()[highlight_ga.ga_len].sg_name_u = vim_strsave_up(name);
-  ++highlight_ga.ga_len;
+  // Append another syntax_highlight entry.
+  struct hl_group* hlgp = GA_APPEND_VIA_PTR(struct hl_group, &highlight_ga);
+  memset(hlgp, 0, sizeof(*hlgp));
+  hlgp->sg_name = name;
+  hlgp->sg_name_u = vim_strsave_up(name);
 
   return highlight_ga.ga_len;               /* ID is index plus one */
 }
@@ -7620,7 +7605,7 @@ static void highlight_list_two(int cnt, int attr)
   msg_puts_attr((char_u *)&("N \bI \b!  \b"[cnt / 11]), attr);
   msg_clr_eos();
   out_flush();
-  ui_delay(cnt == 99 ? 40L : (long)cnt * 50L, FALSE);
+  ui_delay(cnt == 99 ? 40L : (long)cnt * 50L, false);
 }
 
 

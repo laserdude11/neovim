@@ -43,9 +43,12 @@
 /* #undef REGEXP_DEBUG */
 /* #define REGEXP_DEBUG */
 
+#include <inttypes.h>
+#include <stdbool.h>
 #include <string.h>
 
 #include "nvim/vim.h"
+#include "nvim/ascii.h"
 #include "nvim/regexp.h"
 #include "nvim/charset.h"
 #include "nvim/eval.h"
@@ -255,6 +258,7 @@
 
 #define RE_MARK         207     /* mark cmp  Match mark position */
 #define RE_VISUAL       208     /*	Match Visual area */
+#define RE_COMPOSING    209     // any composing characters
 
 /*
  * Magic characters have a special meaning, they don't match literally.
@@ -271,7 +275,7 @@
  * This is impossible, so we declare a pointer to a function returning a
  * pointer to a function returning void. This should work for all compilers.
  */
-typedef void (*(*fptr_T)(int *, int))();
+typedef void (*(*fptr_T)(int *, int))(void);
 
 typedef struct {
   char_u     *regparse;
@@ -1253,12 +1257,6 @@ static regprog_T *bt_regcomp(char_u *expr, int re_flags)
   if (reg(REG_NOPAREN, &flags) == NULL)
     return NULL;
 
-  /* Small enough for pointer-storage convention? */
-#ifdef SMALL_MALLOC             /* 16 bit storage allocation */
-  if (regsize >= 65536L - 256L)
-    EMSG_RET_NULL(_("E339: Pattern too long"));
-#endif
-
   /* Allocate space. */
   bt_regprog_T *r = xmalloc(sizeof(bt_regprog_T) + regsize);
 
@@ -2027,6 +2025,10 @@ static char_u *regatom(int *flagp)
       ret = regnode(RE_VISUAL);
       break;
 
+    case 'C':
+      ret = regnode(RE_COMPOSING);
+      break;
+
     /* \%[abc]: Emit as a list of branches, all ending at the last
      * branch which matches nothing. */
     case '[':
@@ -2788,17 +2790,29 @@ static int peekchr(void)
        * either "\|", "\)", "\&", or "\n" */
       if (reg_magic >= MAGIC_OFF) {
         char_u *p = regparse + 1;
+        bool is_magic_all = (reg_magic == MAGIC_ALL);
 
-        /* ignore \c \C \m and \M after '$' */
+        // ignore \c \C \m \M \v \V and \Z after '$'
         while (p[0] == '\\' && (p[1] == 'c' || p[1] == 'C'
-                                || p[1] == 'm' || p[1] == 'M' || p[1] == 'Z'))
+                                || p[1] == 'm' || p[1] == 'M'
+                                || p[1] == 'v' || p[1] == 'V'
+                                || p[1] == 'Z')) {
+          if (p[1] == 'v') {
+            is_magic_all = true;
+          } else if (p[1] == 'm' || p[1] == 'M' || p[1] == 'V') {
+            is_magic_all = false;
+          }
           p += 2;
+        }
         if (p[0] == NUL
             || (p[0] == '\\'
                 && (p[1] == '|' || p[1] == '&' || p[1] == ')'
                     || p[1] == 'n'))
-            || reg_magic == MAGIC_ALL)
+            || (is_magic_all
+                && (p[0] == '|' || p[0] == '&' || p[0] == ')'))
+            || reg_magic == MAGIC_ALL) {
           curchr = Magic('$');
+        }
       }
       break;
     case '\\':
@@ -3180,8 +3194,8 @@ static int reg_line_lbr;                    /* "\n" in string is line break */
  * or regbehind_T.
  * "backpos_T" is a table with backpos_T for BACK
  */
-static garray_T regstack = {0, 0, 0, 0, NULL};
-static garray_T backpos = {0, 0, 0, 0, NULL};
+static garray_T regstack = GA_EMPTY_INIT_VALUE;
+static garray_T backpos = GA_EMPTY_INIT_VALUE;
 
 /*
  * Both for regstack and backpos tables we use the following strategy of
@@ -3263,21 +3277,20 @@ bt_regexec_nl (
 }
 
 
-/*
- * Match a regexp against multiple lines.
- * "rmp->regprog" is a compiled regexp as returned by vim_regcomp().
- * Uses curbuf for line count and 'iskeyword'.
- *
- * Return zero if there is no match.  Return number of lines contained in the
- * match otherwise.
- */
-static long bt_regexec_multi(rmp, win, buf, lnum, col, tm)
-regmmatch_T *rmp;
-win_T       *win;               /* window in which to search or NULL */
-buf_T       *buf;               /* buffer in which to search */
-linenr_T lnum;                  /* nr of line to start looking for match */
-colnr_T col;                    /* column to start looking for match */
-proftime_T  *tm;                /* timeout limit or NULL */
+/// Matches a regexp against multiple lines.
+/// "rmp->regprog" is a compiled regexp as returned by vim_regcomp().
+/// Uses curbuf for line count and 'iskeyword'.
+/// 
+/// @param win Window in which to search or NULL
+/// @param buf Buffer in which to search
+/// @param lnum Number of line to start looking for match 
+/// @param col Column to start looking for match
+/// @param tm Timeout limit or NULL
+///
+/// @return zero if there is no match and number of lines contained in the match
+///         otherwise.
+static long bt_regexec_multi(regmmatch_T *rmp, win_T *win, buf_T *buf,
+                             linenr_T lnum, colnr_T col, proftime_T *tm)
 {
   long r;
 
@@ -3319,13 +3332,13 @@ static long bt_regexec_both(char_u *line,
      * onto the regstack. */
     ga_init(&regstack, 1, REGSTACK_INITIAL);
     ga_grow(&regstack, REGSTACK_INITIAL);
-    regstack.ga_growsize = REGSTACK_INITIAL * 8;
+    ga_set_growsize(&regstack, REGSTACK_INITIAL * 8);
   }
 
   if (backpos.ga_data == NULL) {
     ga_init(&backpos, sizeof(backpos_T), BACKPOS_INITIAL);
     ga_grow(&backpos, BACKPOS_INITIAL);
-    backpos.ga_growsize = BACKPOS_INITIAL * 8;
+    ga_set_growsize(&backpos, BACKPOS_INITIAL * 8);
   }
 
   if (REG_MULTI) {
@@ -3466,7 +3479,7 @@ static long bt_regexec_both(char_u *line,
       /* Check for timeout once in a twenty times to avoid overhead. */
       if (tm != NULL && ++tm_count == 20) {
         tm_count = 0;
-        if (profile_passed_limit(tm))
+        if (profile_passed_limit(*tm))
           break;
       }
     }
@@ -4103,10 +4116,12 @@ regmatch (
                 status = RA_NOMATCH;
               }
             }
-            // Check for following composing character.
+            // Check for following composing character, unless %C
+            // follows (skips over all composing chars).
             if (status != RA_NOMATCH && enc_utf8
                 && UTF_COMPOSINGLIKE(reginput, reginput + len)
-                && !ireg_icombine) {
+                && !ireg_icombine
+                && OP(next) != RE_COMPOSING) {
               // raaron: This code makes a composing character get
               // ignored, which is the correct behavior (sometimes)
               // for voweled Hebrew texts.
@@ -4171,13 +4186,21 @@ regmatch (
             status = RA_NOMATCH;
           break;
 
+        case RE_COMPOSING:
+          if (enc_utf8) {
+            // Skip composing characters.
+            while (utf_iscomposing(utf_ptr2char(reginput))) {
+              mb_cptr_adv(reginput);
+            }
+          }
+          break;
+
         case NOTHING:
           break;
 
         case BACK:
         {
           int i;
-          backpos_T       *bp;
 
           /*
            * When we run into BACK we need to check if we don't keep
@@ -4187,17 +4210,13 @@ regmatch (
            * The positions are stored in "backpos" and found by the
            * current value of "scan", the position in the RE program.
            */
-          bp = (backpos_T *)backpos.ga_data;
+          backpos_T *bp = (backpos_T *)backpos.ga_data;
           for (i = 0; i < backpos.ga_len; ++i)
             if (bp[i].bp_scan == scan)
               break;
           if (i == backpos.ga_len) {
-            /* First time at this BACK, make room to store the pos. */
-            ga_grow(&backpos, 1);
-            /* get "ga_data" again, it may have changed */
-            bp = (backpos_T *)backpos.ga_data;
-            bp[i].bp_scan = scan;
-            ++backpos.ga_len;
+            backpos_T *p = GA_APPEND_VIA_PTR(backpos_T, &backpos);
+            p->bp_scan = scan;
           } else if (reg_save_equal(&bp[i].bp_pos))
             /* Still at same position as last time, fail. */
             status = RA_NOMATCH;
@@ -6267,36 +6286,28 @@ static char_u *cstrchr(char_u *s, int c)
 
 
 
-static fptr_T do_upper(d, c)
-int         *d;
-int c;
+static fptr_T do_upper(int *d, int c)
 {
   *d = vim_toupper(c);
 
   return (fptr_T)NULL;
 }
 
-static fptr_T do_Upper(d, c)
-int         *d;
-int c;
+static fptr_T do_Upper(int *d, int c)
 {
   *d = vim_toupper(c);
 
   return (fptr_T)do_Upper;
 }
 
-static fptr_T do_lower(d, c)
-int         *d;
-int c;
+static fptr_T do_lower(int *d, int c)
 {
   *d = vim_tolower(c);
 
   return (fptr_T)NULL;
 }
 
-static fptr_T do_Lower(d, c)
-int         *d;
-int c;
+static fptr_T do_Lower(int *d, int c)
 {
   *d = vim_tolower(c);
 
@@ -6938,8 +6949,9 @@ regprog_T *vim_regcomp(char_u *expr_arg, int re_flags)
       regexp_engine = expr[4] - '0';
       expr += 5;
 #ifdef REGEXP_DEBUG
-      EMSG3("New regexp mode selected (%d): %s", regexp_engine,
-          regname[newengine]);
+      smsg((char_u *)"New regexp mode selected (%d): %s",
+           regexp_engine,
+           regname[newengine]);
 #endif
     } else {
       EMSG(_(

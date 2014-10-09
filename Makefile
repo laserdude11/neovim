@@ -74,8 +74,11 @@ endif
 	mkdir -p build
 	touch $@
 
-test: | nvim
+oldtest: | nvim
 	+$(SINGLE_MAKE) -C src/nvim/testdir $(MAKEOVERRIDES)
+
+test: | nvim
+	+$(BUILD_CMD) -C build test
 
 unittest: | nvim
 	+$(BUILD_CMD) -C build unittest

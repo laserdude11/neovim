@@ -1,19 +1,16 @@
 /// @file version.c
 ///
-/// Vim originated from Stevie version 3.6 (Fish disk 217) by GRWalter (Fred)
-/// It has been changed beyond recognition since then.
-///
-/// Differences between version 6.x and 7.x can be found with ":help version7".
-/// Differences between version 5.x and 6.x can be found with ":help version6".
-/// Differences between version 4.x and 5.x can be found with ":help version5".
-/// Differences between version 3.0 and 4.x can be found with ":help version4".
-/// All the remarks about older versions have been removed, they are not very
-/// interesting.
+/// Nvim was forked from Vim 7.4.160.
+/// Vim originated from Stevie version 3.6 (Fish disk 217) by GRWalter (Fred).
+
+#include <inttypes.h>
 
 #include "nvim/vim.h"
+#include "nvim/ascii.h"
 #include "nvim/version.h"
 #include "nvim/charset.h"
 #include "nvim/memline.h"
+#include "nvim/memory.h"
 #include "nvim/message.h"
 #include "nvim/misc2.h"
 #include "nvim/screen.h"
@@ -21,10 +18,8 @@
 #include "nvim/version_defs.h"
 
 char *Version = VIM_VERSION_SHORT;
-static char *mediumVersion = VIM_VERSION_MEDIUM;
-
-char *longVersion = VIM_VERSION_LONG_DATE __DATE__ " " __TIME__ ")";
-
+char *longVersion = NVIM_VERSION_LONG " (compiled " __DATE__ " " __TIME__ ")";
+char *version_commit = "Commit: " NVIM_VERSION_COMMIT;
 
 #ifdef INCLUDE_GENERATED_DECLARATIONS
 # include "version.c.generated.h"
@@ -57,11 +52,7 @@ static char *(features[]) = {
   "+conceal",
   "+cscope",
   "+cursorbind",
-#ifdef CURSOR_SHAPE
   "+cursorshape",
-#else  // ifdef CURSOR_SHAPE
-  "-cursorshape",
-#endif  // ifdef CURSOR_SHAPE
   "+dialog_con",
   "+diff",
   "+digraphs",
@@ -98,11 +89,7 @@ static char *(features[]) = {
   "+jumplist",
   "+keymap",
   "+langmap",
-#ifdef FEAT_LIBCALL
   "+libcall",
-#else   // ifdef FEAT_LIBCALL
-  "-libcall",
-#endif  // ifdef FEAT_LIBCALL
   "+linebreak",
   "+lispindent",
   "+listcmds",
@@ -116,11 +103,6 @@ static char *(features[]) = {
 #if defined(UNIX)
   "+mouse_dec",
   "-mouse_gpm",
-# ifdef FEAT_MOUSE_JSB
-  "+mouse_jsbterm",
-# else  // ifdef FEAT_MOUSE_JSB
-  "-mouse_jsbterm",
-# endif  // ifdef FEAT_MOUSE_JSB
   "+mouse_netterm",
 #endif  // if defined(UNIX)
 
@@ -145,20 +127,12 @@ static char *(features[]) = {
   "+scrollbind",
   "+signs",
   "+smartindent",
-#ifdef STARTUPTIME
   "+startuptime",
-#else  // ifdef STARTUPTIME
-  "-startuptime",
-#endif  // ifdef STARTUPTIME
   "+statusline",
   "+syntax",
   "+tag_binary",
   "+tag_old_static",
-#ifdef FEAT_TAG_ANYWHITE
-  "+tag_any_white",
-#else  // ifdef FEAT_TAG_ANYWHITE
   "-tag_any_white",
-#endif  // ifdef FEAT_TAG_ANYWHITE
 #if defined(UNIX)
 
   // only Unix can have terminfo instead of termcap
@@ -201,77 +175,217 @@ static char *(features[]) = {
 };
 
 static int included_patches[] = {
-  // Add new patch number below this line
-  //316,
-  //315,
-  //314,
-  //313,
-  //312,
+  //457,
+  //456,
+  //455,
+  454,
+  //453,
+  //452,
+  //451,
+  //450,
+  //449,
+  //448,
+  //447,
+  //446,
+  //445,
+  //444,
+  //443,
+  //442,
+  //441,
+  //440,
+  //439,
+  //438,
+  //437,
+  //436,
+  //435,
+  //434,
+  //433,
+  //432 NA
+  //431 NA
+  //430,
+  //429 NA
+  //428 NA
+  //427,
+  //426 NA
+  //425,
+  //424 NA
+  //423,
+  //422,
+  //421,
+  //420 NA
+  //419,
+  //418,
+  //417,
+  //416,
+  //415,
+  //414,
+  //413 NA
+  //412 NA
+  411,
+  410,
+  //409 NA
+  //408,
+  407,
+  //406,
+  405,
+  //404 NA
+  //403 NA
+  //402,
+  //401 NA
+  //400 NA
+  //399 NA
+  //398,
+  //397,
+  //396,
+  //395,
+  //394,
+  //393,
+  392,
+  391,
+  //390,
+  //389,
+  388,
+  387,
+  386,
+  //385,
+  //384 NA
+  383,
+  382,
+  381,
+  //380 NA
+  379,
+  //378,
+  377,
+  376,
+  375,
+  374,
+  373,
+  372,
+  371,
+  370,
+  369,
+  368,
+  367,
+  //366 NA
+  365,
+  364,
+  //363 NA
+  362,
+  361,
+  360,
+  359,
+  358,
+  357,
+  //356 NA
+  //355,
+  //354 NA
+  353,
+  352,
+  351,
+  //350,
+  349,
+  348,
+  347,
+  346,
+  345,
+  344,
+  343,
+  //342 NA
+  341,
+  //340 NA
+  339,
+  338,
+  337,
+  //336,
+  335,
+  334,
+  //333 NA
+  //332 NA
+  331,
+  330,
+  329,
+  328,
+  327,
+  //326 NA
+  325,
+  //324,
+  323,
+  //322 NA
+  //321 NA
+  320,
+  //319 NA
+  318,
+  317,
+  //316 NA
+  315,
+  314,
+  313,
+  312,
   //311,
-  //310,
-  //309,
-  //308,
-  //307,
-  //306,
-  //305,
-  //304,
+  310,
+  309,
+  308,
+  //307 NA
+  306,
+  305,
+  //304 NA
   303,
   302,
   301,
-  //300,
-  //299,
+  //300 NA
+  //299 NA
   298,
-  //297,
-  //296,
-  //295,
-  //294,
-  //293,
+  297,
+  296,
+  295,
+  294,
+  293,
   292,
-  //291,
+  291,
   290,
   289,
   288,
-  //287,
+  //287 NA
   286,
   285,
   284,
-  //283,
+  //283 NA
   282,
   281,
   280,
-  //279,
-  //278,
+  279,
+  278,
   277,
-  //276,
+  276,
   275,
   274,
-  //273,
+  //273 NA
   272,
-  //271,
-  //270,
+  //271 NA
+  //270 NA
   269,
   268,
   267,
   266,
   265,
   264,
-  //263,
+  //263 NA
   262,
   261,
   260,
-  //259,
-  //258,
-  //257,
-  //256,
+  //259 NA
+  //258 NA
+  //257 NA
+  256,
   //255,
   //254,
   253,
-  //252,
+  //252 NA
   251,
-  //250,
+  //250 NA
   //249,
-  //248,
-  //247,
+  248,
+  247,
   //246,
   245,
   //244,
@@ -283,81 +397,81 @@ static int included_patches[] = {
   //238,
   237,
   236,
-  //235,
+  235,
   234,
   233,
   232,
-  //231,
-  //230,
+  231,
+  230,
   229,
-  //228,
-  //227,
+  //228 NA
+  //227 NA
   226,
-  //225,
-  //224,
-  //223,
-  //222,
+  //225 NA
+  //224 NA
+  //223 NA
+  //222 NA
   221,
-  //220,
+  220,
   219,
   218,
-  //217,
-  //216,
+  //217 NA
+  //216 NA
   215,
-  //214,
+  //214 NA
   213,
-  //212,
+  //212 NA
   //211,
   210,
   209,
-  //208,
+  //208 NA
   207,
-  //206,
+  //206 NA
   205,
   204,
   203,
-  //202,
-  //201,
-  //200,
+  //202 NA
+  201,
+  //200 NA
   199,
-  //198,
-  //197,
-  //196,
-  //195,
-  //194,
+  //198 NA
+  //197 NA
+  //196 NA
+  //195 NA
+  //194 NA
   193,
   192,
   191,
-  //190,
-  //189,
-  //188,
+  //190 NA
+  //189 NA
+  //188 NA
   187,
   186,
-  //185,
+  //185 NA
   184,
-  //183,
-  //182,
+  //183 NA
+  //182 NA
   181,
-  //180,
-  //179,
+  //180 NA
+  //179 NA
   178,
-  //177,
-  //176,
-  //175,
-  //174,
+  //177 NA
+  //176 NA
+  //175 NA
+  //174 NA
   173,
   172,
   171,
   170,
   169,
-  //168,
+  //168 NA
   167,
   166,
-  //165,
-  //164,
-  //163,
-  //162,
-  //161,
+  165,
+  //164 NA
+  //163 NA
+  //162 NA
+  //161 NA
   160,
   159,
   158,
@@ -629,59 +743,23 @@ static void list_features(void)
 
 void list_version(void)
 {
-  int i;
-  int first;
-  char *s = "";
-
   // When adding features here, don't forget to update the list of
   // internal variables in eval.c!
   MSG(longVersion);
-
-  // Print the list of patch numbers if there is at least one.
-  // Print a range when patches are consecutive: "1-10, 12, 15-40, 42-45"
-  if (included_patches[0] != 0) {
-    MSG_PUTS(_("\nIncluded patches: "));
-    first = -1;
-
-    // find last one
-    for (i = 0; included_patches[i] != 0; ++i) {}
-
-    while (--i >= 0) {
-      if (first < 0) {
-        first = included_patches[i];
-      }
-
-      if ((i == 0) || (included_patches[i - 1] != included_patches[i] + 1)) {
-        MSG_PUTS(s);
-        s = ", ";
-        msg_outnum((long)first);
-
-        if (first != included_patches[i]) {
-          MSG_PUTS("-");
-          msg_outnum((long)included_patches[i]);
-        }
-        first = -1;
-      }
-    }
-  }
+  MSG(version_commit);
 
   // Print the list of extra patch descriptions if there is at least one.
+  char *s = "";
   if (extra_patches[0] != NULL) {
     MSG_PUTS(_("\nExtra patches: "));
     s = "";
 
-    for (i = 0; extra_patches[i] != NULL; ++i) {
+    for (int i = 0; extra_patches[i] != NULL; ++i) {
       MSG_PUTS(s);
       s = ", ";
       MSG_PUTS(extra_patches[i]);
     }
   }
-
-#ifdef MODIFIED_BY
-  MSG_PUTS("\n");
-  MSG_PUTS(_("Modified by "));
-  MSG_PUTS(MODIFIED_BY);
-#endif  // ifdef MODIFIED_BY
 
 #ifdef HAVE_PATHDEF
 
@@ -700,8 +778,6 @@ void list_version(void)
   }
 #endif  // ifdef HAVE_PATHDEF
 
-  MSG_PUTS(_("\nHuge version "));
-  MSG_PUTS(_("without GUI."));
   version_msg(_("  Features included (+) or not (-):\n"));
 
   list_features();
@@ -749,11 +825,6 @@ void list_version(void)
     version_msg((char *)default_vimruntime_dir);
     version_msg("\"\n");
   }
-  version_msg(_("Compilation: "));
-  version_msg((char *)all_cflags);
-  version_msg("\n");
-  version_msg(_("Linking: "));
-  version_msg((char *)all_lflags);
 #endif  // ifdef HAVE_PATHDEF
 #ifdef DEBUG
   version_msg("\n");
@@ -806,13 +877,9 @@ void intro_message(int colon)
   int sponsor;
   char *p;
   static char *(lines[]) = {
-    N_("VIM - Vi IMproved"),
+    N_(NVIM_VERSION_LONG),
     "",
-    N_("version "),
     N_("by Bram Moolenaar et al."),
-#ifdef MODIFIED_BY
-    " ",
-#endif  // ifdef MODIFIED_BY
     N_("Vim is open source and freely distributable"),
     "",
     N_("Help poor children in Uganda!"),
@@ -820,7 +887,6 @@ void intro_message(int colon)
     "",
     N_("type  :q<Enter>               to exit         "),
     N_("type  :help<Enter>  or  <F1>  for on-line help"),
-    N_("type  :help version7<Enter>   for version info"),
     NULL,
     "",
     N_("Running in Vi compatible mode"),
@@ -878,7 +944,7 @@ void intro_message(int colon)
       }
 
       if (*p != NUL) {
-        do_intro_line(row, (char_u *)_(p), i == 2, 0);
+        do_intro_line(row, (char_u *)_(p), 0);
       }
       row++;
     }
@@ -890,45 +956,16 @@ void intro_message(int colon)
   }
 }
 
-static void do_intro_line(int row, char_u *mesg, int add_version, int attr)
+static void do_intro_line(int row, char_u *mesg, int attr)
 {
-  char_u vers[20];
   int col;
   char_u *p;
   int l;
   int clen;
 
-#ifdef MODIFIED_BY
-# define MODBY_LEN 150
-  char_u modby[MODBY_LEN];
-
-  if (*mesg == ' ') {
-    l = STRLCPY(modby, _("Modified by "), MODBY_LEN);
-    if (l < MODBY_LEN - 1) {
-      STRLCPY(modby + l, MODIFIED_BY, MODBY_LEN - l);
-    }
-    mesg = modby;
-  }
-#endif  // ifdef MODIFIED_BY
-
   // Center the message horizontally.
   col = vim_strsize(mesg);
 
-  if (add_version) {
-    STRCPY(vers, mediumVersion);
-
-    if (highest_patch()) {
-      // Check for 9.9x or 9.9xx, alpha/beta version
-      if (isalpha((int)vers[3])) {
-        int len = (isalpha((int)vers[4])) ? 5 : 4;
-        sprintf((char *)vers + len, ".%d%s", highest_patch(),
-                mediumVersion + len);
-      } else {
-        sprintf((char *)vers + 3,   ".%d",   highest_patch());
-      }
-    }
-    col += (int)STRLEN(vers);
-  }
   col = (Columns - col) / 2;
 
   if (col < 0) {
@@ -950,11 +987,6 @@ static void do_intro_line(int row, char_u *mesg, int add_version, int attr)
     }
     screen_puts_len(p, l, row, col, *p == '<' ? hl_attr(HLF_8) : attr);
     col += clen;
-  }
-
-  // Add the version number to the version line.
-  if (add_version) {
-    screen_puts(vers, row, col, 0);
   }
 }
 

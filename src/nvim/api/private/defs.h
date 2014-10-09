@@ -5,21 +5,26 @@
 #include <stdbool.h>
 #include <string.h>
 
-#define ARRAY_DICT_INIT {.size = 0, .items = NULL}
+#define ARRAY_DICT_INIT {.size = 0, .capacity = 0, .items = NULL}
 #define STRING_INIT {.data = NULL, .size = 0}
 #define OBJECT_INIT { .type = kObjectTypeNil }
-#define POSITION_INIT { .row = 0, .col = 0 }
+#define ERROR_INIT { .set = false }
 #define REMOTE_TYPE(type) typedef uint64_t type
 
-#define TYPED_ARRAY_OF(type)                                                  \
-  typedef struct {                                                            \
-    type *items;                                                              \
-    size_t size;                                                              \
-  } type##Array
+#ifdef INCLUDE_GENERATED_DECLARATIONS
+  #define ArrayOf(...) Array
+  #define DictionaryOf(...) Dictionary
+#endif
 
 // Basic types
+typedef enum {
+  kErrorTypeException,
+  kErrorTypeValidation
+} ErrorType;
+
 typedef struct {
-  char msg[256];
+  ErrorType type;
+  char msg[1024];
   bool set;
 } Error;
 
@@ -38,15 +43,6 @@ REMOTE_TYPE(Tabpage);
 
 typedef struct object Object;
 
-TYPED_ARRAY_OF(Buffer);
-TYPED_ARRAY_OF(Window);
-TYPED_ARRAY_OF(Tabpage);
-TYPED_ARRAY_OF(String);
-
-typedef struct {
-  Integer row, col;
-} Position;
-
 typedef struct {
   Object *items;
   size_t size, capacity;
@@ -60,40 +56,30 @@ typedef struct {
 } Dictionary;
 
 typedef enum {
+  kObjectTypeBuffer,
+  kObjectTypeWindow,
+  kObjectTypeTabpage,
   kObjectTypeNil,
   kObjectTypeBoolean,
   kObjectTypeInteger,
   kObjectTypeFloat,
   kObjectTypeString,
-  kObjectTypeBuffer,
-  kObjectTypeWindow,
-  kObjectTypeTabpage,
   kObjectTypeArray,
   kObjectTypeDictionary,
-  kObjectTypePosition,
-  kObjectTypeStringArray,
-  kObjectTypeBufferArray,
-  kObjectTypeWindowArray,
-  kObjectTypeTabpageArray,
 } ObjectType;
 
 struct object {
   ObjectType type;
   union {
+    Buffer buffer;
+    Window window;
+    Tabpage tabpage;
     Boolean boolean;
     Integer integer;
     Float floating;
     String string;
-    Buffer buffer;
-    Window window;
-    Tabpage tabpage;
     Array array;
     Dictionary dictionary;
-    Position position;
-    StringArray stringarray;
-    BufferArray bufferarray;
-    WindowArray windowarray;
-    TabpageArray tabpagearray;
   } data;
 };
 

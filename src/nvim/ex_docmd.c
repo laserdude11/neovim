@@ -11,8 +11,12 @@
  */
 
 #include <string.h>
+#include <stdbool.h>
+#include <errno.h>
+#include <inttypes.h>
 
 #include "nvim/vim.h"
+#include "nvim/ascii.h"
 #include "nvim/ex_docmd.h"
 #include "nvim/buffer.h"
 #include "nvim/charset.h"
@@ -62,6 +66,7 @@
 #include "nvim/version.h"
 #include "nvim/window.h"
 #include "nvim/os/os.h"
+#include "nvim/ex_cmds_defs.h"
 
 static int quitmore = 0;
 static int ex_pressedreturn = FALSE;
@@ -152,42 +157,9 @@ static int did_lcd;             /* whether ":lcd" was produced for a session */
 /*
  * Declare cmdnames[].
  */
-#define DO_DECLARE_EXCMD
-#include "nvim/ex_cmds_defs.h"
-
-/*
- * Table used to quickly search for a command, based on its first character.
- */
-static cmdidx_T cmdidxs[27] =
-{
-  CMD_append,
-  CMD_buffer,
-  CMD_change,
-  CMD_delete,
-  CMD_edit,
-  CMD_file,
-  CMD_global,
-  CMD_help,
-  CMD_insert,
-  CMD_join,
-  CMD_k,
-  CMD_list,
-  CMD_move,
-  CMD_next,
-  CMD_open,
-  CMD_print,
-  CMD_quit,
-  CMD_read,
-  CMD_substitute,
-  CMD_t,
-  CMD_undo,
-  CMD_vglobal,
-  CMD_write,
-  CMD_xit,
-  CMD_yank,
-  CMD_z,
-  CMD_bang
-};
+#ifdef INCLUDE_GENERATED_DECLARATIONS
+# include "ex_cmds_defs.generated.h"
+#endif
 
 static char_u dollar_command[2] = {'$', 0};
 
@@ -1037,10 +1009,9 @@ static char_u *get_loop_line(int c, void *cookie, int indent)
  */
 static void store_loop_line(garray_T *gap, char_u *line)
 {
-  ga_grow(gap, 1);
-  ((wcmd_T *)(gap->ga_data))[gap->ga_len].line = vim_strsave(line);
-  ((wcmd_T *)(gap->ga_data))[gap->ga_len].lnum = sourcing_lnum;
-  ++gap->ga_len;
+  wcmd_T *p = GA_APPEND_VIA_PTR(wcmd_T, gap);
+  p->line = vim_strsave(line);
+  p->lnum = sourcing_lnum;
 }
 
 /*
@@ -1856,6 +1827,7 @@ static char_u * do_one_cmd(char_u **cmdlinep,
     case CMD_noautocmd:
     case CMD_noswapfile:
     case CMD_psearch:
+    case CMD_python:
     case CMD_return:
     case CMD_rightbelow:
     case CMD_silent:
@@ -5216,13 +5188,12 @@ static void ex_close(exarg_T *eap)
  */
 static void ex_pclose(exarg_T *eap)
 {
-  win_T       *win;
-
-  for (win = firstwin; win != NULL; win = win->w_next)
+  FOR_ALL_WINDOWS_IN_TAB(win, curtab) {
     if (win->w_p_pvw) {
       ex_win_close(eap->forceit, win, NULL);
       break;
     }
+  }
 }
 
 /*
@@ -5296,9 +5267,6 @@ static void ex_tabclose(exarg_T *eap)
  */
 static void ex_tabonly(exarg_T *eap)
 {
-  tabpage_T   *tp;
-  int done;
-
   if (cmdwin_type != 0)
     cmdwin_result = K_IGNORE;
   else if (first_tabpage->tp_next == NULL)
@@ -5306,8 +5274,8 @@ static void ex_tabonly(exarg_T *eap)
   else {
     /* Repeat this up to a 1000 times, because autocommands may mess
      * up the lists. */
-    for (done = 0; done < 1000; ++done) {
-      for (tp = first_tabpage; tp != NULL; tp = tp->tp_next)
+    for (int done = 0; done < 1000; ++done) {
+      FOR_ALL_TABS(tp) {
         if (tp->tp_topframe != topframe) {
           tabpage_close_other(tp, eap->forceit);
           /* if we failed to close it quit */
@@ -5316,8 +5284,10 @@ static void ex_tabonly(exarg_T *eap)
           /* start over, "tp" is now invalid */
           break;
         }
-      if (first_tabpage->tp_next == NULL)
+      }
+      if (first_tabpage->tp_next == NULL) {
         break;
+      }
     }
   }
 }
@@ -5533,6 +5503,7 @@ void alist_new(void)
 {
   curwin->w_alist = xmalloc(sizeof(*curwin->w_alist));
   curwin->w_alist->al_refcount = 1;
+  curwin->w_alist->id = ++max_alist_id;
   alist_init(curwin->w_alist);
 }
 
@@ -5635,18 +5606,21 @@ alist_add (
  */
 void alist_slash_adjust(void)
 {
-  int i;
-  win_T       *wp;
-  tabpage_T   *tp;
-
-  for (i = 0; i < GARGCOUNT; ++i)
-    if (GARGLIST[i].ae_fname != NULL)
+  for (int i = 0; i < GARGCOUNT; ++i) {
+    if (GARGLIST[i].ae_fname != NULL) {
       slash_adjust(GARGLIST[i].ae_fname);
-  FOR_ALL_TAB_WINDOWS(tp, wp)
-  if (wp->w_alist != &global_alist)
-    for (i = 0; i < WARGCOUNT(wp); ++i)
-      if (WARGLIST(wp)[i].ae_fname != NULL)
-        slash_adjust(WARGLIST(wp)[i].ae_fname);
+    }
+  }
+
+  FOR_ALL_TAB_WINDOWS(tp, wp) {
+    if (wp->w_alist != &global_alist) {
+      for (int i = 0; i < WARGCOUNT(wp); ++i) {
+        if (WARGLIST(wp)[i].ae_fname != NULL) {
+          slash_adjust(WARGLIST(wp)[i].ae_fname);
+        }
+      }
+    }
+  }
 }
 
 #endif
@@ -5836,24 +5810,27 @@ static void ex_tabmove(exarg_T *eap)
  */
 static void ex_tabs(exarg_T *eap)
 {
-  tabpage_T   *tp;
-  win_T       *wp;
   int tabcount = 1;
 
   msg_start();
   msg_scroll = TRUE;
-  for (tp = first_tabpage; tp != NULL && !got_int; tp = tp->tp_next) {
+
+  FOR_ALL_TABS(tp) {
+    if (got_int) {
+       break;
+    }
+
     msg_putchar('\n');
     vim_snprintf((char *)IObuff, IOSIZE, _("Tab page %d"), tabcount++);
     msg_outtrans_attr(IObuff, hl_attr(HLF_T));
     out_flush();            /* output one line at a time */
     ui_breakcheck();
 
-    if (tp  == curtab)
-      wp = firstwin;
-    else
-      wp = tp->tp_firstwin;
-    for (; wp != NULL && !got_int; wp = wp->w_next) {
+    FOR_ALL_WINDOWS_IN_TAB(wp, tp) {
+      if (got_int) {
+        break;
+      }
+
       msg_putchar('\n');
       msg_putchar(wp == curwin ? '>' : ' ');
       msg_putchar(' ');
@@ -6147,7 +6124,6 @@ static void ex_swapname(exarg_T *eap)
  */
 static void ex_syncbind(exarg_T *eap)
 {
-  win_T       *wp;
   win_T       *save_curwin = curwin;
   buf_T       *save_curbuf = curbuf;
   long topline;
@@ -6161,15 +6137,17 @@ static void ex_syncbind(exarg_T *eap)
    */
   if (curwin->w_p_scb) {
     topline = curwin->w_topline;
-    for (wp = firstwin; wp; wp = wp->w_next) {
+    FOR_ALL_WINDOWS_IN_TAB(wp, curtab) {
       if (wp->w_p_scb && wp->w_buffer) {
         y = wp->w_buffer->b_ml.ml_line_count - p_so;
-        if (topline > y)
+        if (topline > y) {
           topline = y;
+        }
       }
     }
-    if (topline < 1)
+    if (topline < 1) {
       topline = 1;
+    }
   } else {
     topline = 1;
   }
@@ -6412,7 +6390,7 @@ void do_sleep(long msec)
   cursor_on();
   out_flush();
   for (done = 0; !got_int && done < msec; done += 1000L) {
-    ui_delay(msec - done > 1000L ? 1000L : msec - done, TRUE);
+    ui_delay(msec - done > 1000L ? 1000L : msec - done, true);
     ui_breakcheck();
   }
 }
@@ -7406,7 +7384,7 @@ static void ex_pedit(exarg_T *eap)
   win_T       *curwin_save = curwin;
 
   g_do_tagpreview = p_pvh;
-  prepare_tagpreview(TRUE);
+  prepare_tagpreview(true);
   keep_help_flag = curwin_save->w_buffer->b_help;
   do_exedit(eap, NULL);
   keep_help_flag = FALSE;
@@ -7414,7 +7392,7 @@ static void ex_pedit(exarg_T *eap)
     /* Return cursor to where we were */
     validate_cursor();
     redraw_later(VALID);
-    win_enter(curwin_save, TRUE);
+    win_enter(curwin_save, true);
   }
   g_do_tagpreview = 0;
 }
@@ -7867,7 +7845,6 @@ makeopens (
     char_u *dirnow            /* Current directory name */
 )
 {
-  buf_T       *buf;
   int only_save_windows = TRUE;
   int nr;
   int cnr = 1;
@@ -7939,7 +7916,7 @@ makeopens (
     return FAIL;
 
   /* Now put the other buffers into the buffer list */
-  for (buf = firstbuf; buf != NULL; buf = buf->b_next) {
+  FOR_ALL_BUFFERS(buf) {
     if (!(only_save_windows && buf->b_nwindows == 0)
         && !(buf->b_help && !(ssop_flags & SSOP_HELP))
         && buf->b_fname != NULL
@@ -8048,7 +8025,7 @@ makeopens (
      * Remember the window number of the current window after restoring.
      */
     nr = 0;
-    for (wp = tab_firstwin; wp != NULL; wp = W_NEXT(wp)) {
+    for (wp = tab_firstwin; wp != NULL; wp = wp->w_next) {
       if (ses_do_win(wp))
         ++nr;
       else
@@ -8888,7 +8865,7 @@ static void ex_match(exarg_T *eap)
 
       c = *end;
       *end = NUL;
-      match_add(curwin, g, p + 1, 10, id);
+      match_add(curwin, g, p + 1, 10, id, NULL);
       free(g);
       *end = c;
     }

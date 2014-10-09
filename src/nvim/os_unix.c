@@ -16,19 +16,14 @@
  * changed beyond recognition.
  */
 
-/*
- * Some systems have a prototype for select() that has (int *) instead of
- * (fd_set *), which is wrong. This define removes that prototype. We define
- * our own prototype below.
- * Don't use it for the Mac, it causes a warning for precompiled headers.
- * TODO: use a configure check for precompiled headers?
- */
-# define select select_declared_wrong
-
+#include <errno.h>
+#include <inttypes.h>
+#include <stdbool.h>
 #include <string.h>
 
 #include "nvim/api/private/handle.h"
 #include "nvim/vim.h"
+#include "nvim/ascii.h"
 #include "nvim/os_unix.h"
 #include "nvim/buffer.h"
 #include "nvim/charset.h"
@@ -48,7 +43,9 @@
 #include "nvim/screen.h"
 #include "nvim/strings.h"
 #include "nvim/syntax.h"
+#include "nvim/tempfile.h"
 #include "nvim/term.h"
+#include "nvim/types.h"
 #include "nvim/ui.h"
 #include "nvim/os/os.h"
 #include "nvim/os/time.h"
@@ -57,6 +54,8 @@
 #include "nvim/os/shell.h"
 #include "nvim/os/signal.h"
 #include "nvim/os/job.h"
+#include "nvim/os/msgpack_rpc.h"
+#include "nvim/os/msgpack_rpc_helpers.h"
 
 #if defined(HAVE_SYS_IOCTL_H)
 # include <sys/ioctl.h>
@@ -68,11 +67,6 @@
 
 #if defined(HAVE_TERMIOS_H)
 # include <termios.h>
-#endif
-
-/* shared library access */
-#if defined(HAVE_DLFCN_H) && defined(USE_DLOPEN)
-# include <dlfcn.h>
 #endif
 
 #ifdef HAVE_SELINUX
@@ -96,46 +90,28 @@ static int did_set_icon = FALSE;
  */
 void mch_write(char_u *s, int len)
 {
+  if (embedded_mode) {
+    // TODO(tarruda): This is a temporary hack to stop Neovim from writing
+    // messages to stdout in embedded mode. In the future, embedded mode will
+    // be the only possibility(GUIs will always start neovim with a msgpack-rpc
+    // over stdio) and this function won't exist.
+    //
+    // The reason for this is because before Neovim fully migrates to a
+    // msgpack-rpc-driven architecture, we must have a fully functional
+    // UI working
+    return;
+  }
+
   ignored = (int)write(1, (char *)s, len);
   if (p_wd)             /* Unix is too fast, slow down a bit more */
     os_microdelay(p_wd, false);
 }
 
 /*
- * A simplistic version of setjmp() that only allows one level of using.
- * Don't call twice before calling mch_endjmp()!.
- * Usage:
- *	mch_startjmp();
- *	if (SETJMP(lc_jump_env) != 0)
- *	{
- *	    mch_didjmp();
- *	    EMSG("crash!");
- *	}
- *	else
- *	{
- *	    do_the_work;
- *	    mch_endjmp();
- *	}
- * Note: Can't move SETJMP() here, because a function calling setjmp() must
- * not return before the saved environment is used.
- * Returns OK for normal return, FAIL when the protected code caused a
- * problem and LONGJMP() was used.
- */
-void mch_startjmp()
-{
-  lc_active = TRUE;
-}
-
-void mch_endjmp()
-{
-  lc_active = FALSE;
-}
-
-/*
  * If the machine has job control, use it to suspend the program,
  * otherwise fake it by starting a new shell.
  */
-void mch_suspend()
+void mch_suspend(void)
 {
   /* BeOS does have SIGTSTP, but it doesn't work. */
 #if defined(SIGTSTP) && !defined(__BEOS__)
@@ -164,7 +140,7 @@ void mch_suspend()
     long wait_time;
     for (wait_time = 0; !sigcont_received && wait_time <= 3L; wait_time++)
       /* Loop is not entered most of the time */
-      os_delay(wait_time, FALSE);
+      os_delay(wait_time, false);
   }
 # endif
 
@@ -179,7 +155,7 @@ void mch_suspend()
 #endif
 }
 
-void mch_init()
+void mch_init(void)
 {
   Columns = 80;
   Rows = 24;
@@ -190,6 +166,8 @@ void mch_init()
   mac_conv_init();
 #endif
 
+  msgpack_rpc_init();
+  msgpack_rpc_helpers_init();
   event_init();
 }
 
@@ -210,12 +188,12 @@ static int get_x11_icon(int test_only)
 }
 
 
-int mch_can_restore_title()
+int mch_can_restore_title(void)
 {
   return get_x11_title(TRUE);
 }
 
-int mch_can_restore_icon()
+int mch_can_restore_icon(void)
 {
   return get_x11_icon(TRUE);
 }
@@ -323,7 +301,7 @@ int use_xterm_like_mouse(char_u *name)
  * Return 3 for "urxvt".
  * Return 4 for "sgr".
  */
-int use_xterm_mouse()
+int use_xterm_mouse(void)
 {
   if (ttym_flags == TTYM_SGR)
     return 4;
@@ -334,40 +312,6 @@ int use_xterm_mouse()
   if (ttym_flags == TTYM_XTERM)
     return 1;
   return 0;
-}
-
-int vim_is_iris(char_u *name)
-{
-  if (name == NULL)
-    return FALSE;
-  return STRNICMP(name, "iris-ansi", 9) == 0
-         || STRCMP(name, "builtin_iris-ansi") == 0;
-}
-
-int vim_is_vt300(char_u *name)
-{
-  if (name == NULL)
-    return FALSE;              /* actually all ANSI comp. terminals should be here  */
-  /* catch VT100 - VT5xx */
-  return (STRNICMP(name, "vt", 2) == 0
-          && vim_strchr((char_u *)"12345", name[2]) != NULL)
-         || STRCMP(name, "builtin_vt320") == 0;
-}
-
-/*
- * Return TRUE if "name" is a terminal for which 'ttyfast' should be set.
- * This should include all windowed terminal emulators.
- */
-int vim_is_fastterm(char_u *name)
-{
-  if (name == NULL)
-    return FALSE;
-  if (vim_is_xterm(name) || vim_is_vt300(name) || vim_is_iris(name))
-    return TRUE;
-  return STRNICMP(name, "hpterm", 6) == 0
-         || STRNICMP(name, "sun-cmd", 7) == 0
-         || STRNICMP(name, "screen", 6) == 0
-         || STRNICMP(name, "dtterm", 6) == 0;
 }
 
 #if defined(USE_FNAME_CASE) || defined(PROTO)
@@ -381,12 +325,12 @@ char_u      *name,
 int len               /* buffer size, only used when name gets longer */
 )
 {
-  struct stat st;
   char_u      *slash, *tail;
   DIR         *dirp;
   struct dirent *dp;
 
-  if (lstat((char *)name, &st) >= 0) {
+  FileInfo file_info;
+  if (os_fileinfo_link((char *)name, &file_info)) {
     /* Open the directory where the file is located. */
     slash = vim_strrchr(name, '/');
     if (slash == NULL) {
@@ -406,15 +350,14 @@ int len               /* buffer size, only used when name gets longer */
         if (STRICMP(tail, dp->d_name) == 0
             && STRLEN(tail) == STRLEN(dp->d_name)) {
           char_u newname[MAXPATHL + 1];
-          struct stat st2;
 
           /* Verify the inode is equal. */
           STRLCPY(newname, name, MAXPATHL + 1);
           STRLCPY(newname + (tail - name), dp->d_name,
               MAXPATHL - (tail - name) + 1);
-          if (lstat((char *)newname, &st2) >= 0
-              && st.st_ino == st2.st_ino
-              && st.st_dev == st2.st_dev) {
+          FileInfo file_info_new;
+          if (os_fileinfo_link((char *)newname, &file_info_new)
+              && os_fileinfo_id_equal(&file_info, &file_info_new)) {
             STRCPY(tail, dp->d_name);
             break;
           }
@@ -538,14 +481,15 @@ int mch_nodetype(char_u *name)
   return NODE_WRITABLE;
 }
 
-void mch_early_init()
+void mch_early_init(void)
 {
   handle_init();
   time_init();
 }
 
 #if defined(EXITFREE) || defined(PROTO)
-void mch_free_mem()          {
+void mch_free_mem(void)
+{
   free(oldtitle);
   free(oldicon);
 }
@@ -557,7 +501,7 @@ void mch_free_mem()          {
  * Output a newline when exiting.
  * Make sure the newline goes to the same stream as the text.
  */
-static void exit_scroll()
+static void exit_scroll(void)
 {
   if (silent_mode)
     return;
@@ -723,7 +667,7 @@ void mch_settmode(int tmode)
  * be), they're going to get really annoyed if their erase key starts
  * doing forward deletes for no reason. (Eric Fischer)
  */
-void get_stty()
+void get_stty(void)
 {
   char_u buf[2];
   char_u  *p;
@@ -782,16 +726,16 @@ void mch_setmouse(int on)
   if (ttym_flags == TTYM_URXVT) {
     out_str_nf((char_u *)
         (on
-         ? IF_EB("\033[?1015h", ESC_STR "[?1015h")
-         : IF_EB("\033[?1015l", ESC_STR "[?1015l")));
+         ? "\033[?1015h"
+         : "\033[?1015l"));
     ison = on;
   }
 
   if (ttym_flags == TTYM_SGR) {
     out_str_nf((char_u *)
         (on
-         ? IF_EB("\033[?1006h", ESC_STR "[?1006h")
-         : IF_EB("\033[?1006l", ESC_STR "[?1006l")));
+         ? "\033[?1006h"
+         : "\033[?1006l"));
     ison = on;
   }
 
@@ -799,13 +743,13 @@ void mch_setmouse(int on)
     if (on)     /* enable mouse events, use mouse tracking if available */
       out_str_nf((char_u *)
           (xterm_mouse_vers > 1
-           ? IF_EB("\033[?1002h", ESC_STR "[?1002h")
-           : IF_EB("\033[?1000h", ESC_STR "[?1000h")));
+           ? "\033[?1002h"
+           : "\033[?1000h"));
     else        /* disable mouse events, could probably always send the same */
       out_str_nf((char_u *)
           (xterm_mouse_vers > 1
-           ? IF_EB("\033[?1002l", ESC_STR "[?1002l")
-           : IF_EB("\033[?1000l", ESC_STR "[?1000l")));
+           ? "\033[?1002l"
+           : "\033[?1000l"));
     ison = on;
   } else if (ttym_flags == TTYM_DEC) {
     if (on)     /* enable mouse events */
@@ -817,17 +761,17 @@ void mch_setmouse(int on)
 
 }
 
-/*
- * Set the mouse termcode, depending on the 'term' and 'ttymouse' options.
- */
-void check_mouse_termcode()
+/// Sets the mouse termcode, depending on the 'term' and 'ttymouse' options.
+void check_mouse_termcode(void)
 {
+  xterm_conflict_mouse = false;
+
   if (use_xterm_mouse()
       && use_xterm_mouse() != 3
       ) {
     set_mouse_termcode(KS_MOUSE, (char_u *)(term_is_8bit(T_NAME)
-                                            ? IF_EB("\233M", CSI_STR "M")
-                                            : IF_EB("\033[M", ESC_STR "[M")));
+                                            ? "\233M"
+                                            : "\033[M"));
     if (*p_mouse != NUL) {
       /* force mouse off and maybe on to send possibly new mouse
        * activation sequence to the xterm, with(out) drag tracing. */
@@ -843,45 +787,46 @@ void check_mouse_termcode()
   if (!use_xterm_mouse()
       )
     set_mouse_termcode(KS_NETTERM_MOUSE,
-        (char_u *)IF_EB("\033}", ESC_STR "}"));
+        (char_u *)"\033}");
   else
     del_mouse_termcode(KS_NETTERM_MOUSE);
 
-  /* conflicts with xterm mouse: "\033[" and "\033[M" */
-  if (!use_xterm_mouse()
-      )
+  // Conflicts with xterm mouse: "\033[" and "\033[M".
+  // Also conflicts with the xterm termresponse, skip this if it was requested
+  // already.
+  if (!use_xterm_mouse()) {
     set_mouse_termcode(KS_DEC_MOUSE, (char_u *)(term_is_8bit(T_NAME)
-                                                ? IF_EB("\233",
-                                                    CSI_STR) : IF_EB("\033[",
-                                                    ESC_STR "[")));
-  else
+                                                ? "\233" : "\033["));
+    xterm_conflict_mouse = true;
+  }
+  else {
     del_mouse_termcode(KS_DEC_MOUSE);
+  }
   /* same as the dec mouse */
-  if (use_xterm_mouse() == 3
-      ) {
-    set_mouse_termcode(KS_URXVT_MOUSE, (char_u *)(term_is_8bit(T_NAME)
-                                                  ? IF_EB("\233", CSI_STR)
-                                                  : IF_EB("\033[", ESC_STR "[")));
-
+  if (use_xterm_mouse() == 3 && !did_request_esc_sequence()) {
+    set_mouse_termcode(KS_URXVT_MOUSE,
+                       (char_u *)(term_is_8bit(T_NAME) ? "\233" : "\033["));
     if (*p_mouse != NUL) {
-      mch_setmouse(FALSE);
+      mch_setmouse(false);
       setmouse();
     }
-  } else
+    resume_get_esc_sequence();
+  } else {
     del_mouse_termcode(KS_URXVT_MOUSE);
-  /* same as the dec mouse */
-  if (use_xterm_mouse() == 4
-      ) {
+  }
+  // There is no conflict with xterm mouse.
+  if (use_xterm_mouse() == 4) {
     set_mouse_termcode(KS_SGR_MOUSE, (char_u *)(term_is_8bit(T_NAME)
-                                                ? IF_EB("\233<", CSI_STR "<")
-                                                : IF_EB("\033[<", ESC_STR "[<")));
+                                                ? "\233<"
+                                                : "\033[<"));
 
     if (*p_mouse != NUL) {
       mch_setmouse(FALSE);
       setmouse();
     }
-  } else
+  } else {
     del_mouse_termcode(KS_SGR_MOUSE);
+  }
 }
 
 /*
@@ -892,7 +837,7 @@ void check_mouse_termcode()
  * 4. keep using the old values
  * Return OK when size could be determined, FAIL otherwise.
  */
-int mch_get_shellsize()
+int mch_get_shellsize(void)
 {
   long rows = 0;
   long columns = 0;
@@ -969,7 +914,7 @@ int mch_get_shellsize()
 /*
  * Try to set the window size to Rows and Columns.
  */
-void mch_set_shellsize()
+void mch_set_shellsize(void)
 {
   if (*T_CWS) {
     /*
@@ -1065,7 +1010,7 @@ int mch_expand_wildcards(int num_pat, char_u **pat, int *num_file,
   /*
    * get a name for the temp file
    */
-  if ((tempname = vim_tempname('o')) == NULL) {
+  if ((tempname = vim_tempname()) == NULL) {
     EMSG(_(e_notmp));
     return FAIL;
   }
@@ -1222,7 +1167,7 @@ int mch_expand_wildcards(int num_pat, char_u **pat, int *num_file,
   /* When running in the background, give it some time to create the temp
    * file, but don't wait for it to finish. */
   if (ampersent)
-    os_delay(10L, TRUE);
+    os_delay(10L, true);
 
   free(command);
 
@@ -1389,7 +1334,7 @@ int mch_expand_wildcards(int num_pat, char_u **pat, int *num_file,
       continue;
 
     /* Skip files that are not executable if we check for that. */
-    if (!dir && (flags & EW_EXEC) && !os_can_exe((*file)[i]))
+    if (!dir && (flags & EW_EXEC) && !os_can_exe((*file)[i], NULL))
       continue;
 
     p = xmalloc(STRLEN((*file)[i]) + 1 + dir);
@@ -1491,158 +1436,3 @@ static int have_dollars(int num, char_u **file)
       return TRUE;
   return FALSE;
 }
-
-#if defined(FEAT_LIBCALL) || defined(PROTO)
-typedef char_u * (*STRPROCSTR)(char_u *);
-typedef char_u * (*INTPROCSTR)(int);
-typedef int (*STRPROCINT)(char_u *);
-typedef int (*INTPROCINT)(int);
-
-/*
- * Call a DLL routine which takes either a string or int param
- * and returns an allocated string.
- */
-int mch_libcall(char_u *libname,
-                char_u *funcname,
-                char_u *argstring,         /* NULL when using an argint */
-                int argint,
-                char_u **string_result,    /* NULL when using number_result */
-                int *number_result)
-{
-# if defined(USE_DLOPEN)
-  void        *hinstLib;
-  char        *dlerr = NULL;
-# else
-  shl_t hinstLib;
-# endif
-  STRPROCSTR ProcAdd;
-  INTPROCSTR ProcAddI;
-  char_u      *retval_str = NULL;
-  int retval_int = 0;
-  int success = FALSE;
-
-  /*
-   * Get a handle to the DLL module.
-   */
-# if defined(USE_DLOPEN)
-  /* First clear any error, it's not cleared by the dlopen() call. */
-  (void)dlerror();
-
-  hinstLib = dlopen((char *)libname, RTLD_LAZY
-#  ifdef RTLD_LOCAL
-      | RTLD_LOCAL
-#  endif
-      );
-  if (hinstLib == NULL) {
-    /* "dlerr" must be used before dlclose() */
-    dlerr = (char *)dlerror();
-    if (dlerr != NULL)
-      EMSG2(_("dlerror = \"%s\""), dlerr);
-  }
-# else
-  hinstLib = shl_load((const char*)libname, BIND_IMMEDIATE|BIND_VERBOSE, 0L);
-# endif
-
-  /* If the handle is valid, try to get the function address. */
-  if (hinstLib != NULL) {
-    /*
-     * Catch a crash when calling the library function.  For example when
-     * using a number where a string pointer is expected.
-     */
-    mch_startjmp();
-    if (SETJMP(lc_jump_env) != 0) {
-      success = FALSE;
-# if defined(USE_DLOPEN)
-      dlerr = NULL;
-# endif
-    } else
-    {
-      retval_str = NULL;
-      retval_int = 0;
-
-      if (argstring != NULL) {
-# if defined(USE_DLOPEN)
-        ProcAdd = (STRPROCSTR)dlsym(hinstLib, (const char *)funcname);
-        dlerr = (char *)dlerror();
-# else
-        if (shl_findsym(&hinstLib, (const char *)funcname,
-                TYPE_PROCEDURE, (void *)&ProcAdd) < 0)
-          ProcAdd = NULL;
-# endif
-        if ((success = (ProcAdd != NULL
-# if defined(USE_DLOPEN)
-                        && dlerr == NULL
-# endif
-                        ))) {
-          if (string_result == NULL)
-            retval_int = ((STRPROCINT)ProcAdd)(argstring);
-          else
-            retval_str = (ProcAdd)(argstring);
-        }
-      } else {
-# if defined(USE_DLOPEN)
-        ProcAddI = (INTPROCSTR)dlsym(hinstLib, (const char *)funcname);
-        dlerr = (char *)dlerror();
-# else
-        if (shl_findsym(&hinstLib, (const char *)funcname,
-                TYPE_PROCEDURE, (void *)&ProcAddI) < 0)
-          ProcAddI = NULL;
-# endif
-        if ((success = (ProcAddI != NULL
-# if defined(USE_DLOPEN)
-                        && dlerr == NULL
-# endif
-                        ))) {
-          if (string_result == NULL)
-            retval_int = ((INTPROCINT)ProcAddI)(argint);
-          else
-            retval_str = (ProcAddI)(argint);
-        }
-      }
-
-      /* Save the string before we free the library. */
-      /* Assume that a "1" or "-1" result is an illegal pointer. */
-      if (string_result == NULL)
-        *number_result = retval_int;
-      else if (retval_str != NULL
-               && retval_str != (char_u *)1
-               && retval_str != (char_u *)-1)
-        *string_result = vim_strsave(retval_str);
-    }
-
-    mch_endjmp();
-# ifdef SIGHASARG
-    if (lc_signal != 0) {
-      int i;
-
-      /* try to find the name of this signal */
-      for (i = 0; signal_info[i].sig != -1; i++)
-        if (lc_signal == signal_info[i].sig)
-          break;
-      EMSG2("E368: got SIG%s in libcall()", signal_info[i].name);
-    }
-# endif
-
-# if defined(USE_DLOPEN)
-    /* "dlerr" must be used before dlclose() */
-    if (dlerr != NULL)
-      EMSG2(_("dlerror = \"%s\""), dlerr);
-
-    /* Free the DLL module. */
-    (void)dlclose(hinstLib);
-# else
-    (void)shl_unload(hinstLib);
-# endif
-  }
-
-  if (!success) {
-    EMSG2(_(e_libcall), funcname);
-    return FAIL;
-  }
-
-  return OK;
-}
-#endif
-
-
-

@@ -2,7 +2,12 @@
 ///
 /// Code for diff'ing two, three or four buffers.
 
+#include <errno.h>
+#include <inttypes.h>
+#include <stdbool.h>
+
 #include "nvim/vim.h"
+#include "nvim/ascii.h"
 #include "nvim/diff.h"
 #include "nvim/buffer.h"
 #include "nvim/charset.h"
@@ -25,6 +30,7 @@
 #include "nvim/path.h"
 #include "nvim/screen.h"
 #include "nvim/strings.h"
+#include "nvim/tempfile.h"
 #include "nvim/undo.h"
 #include "nvim/window.h"
 #include "nvim/os/os.h"
@@ -56,8 +62,7 @@ static int diff_a_works = MAYBE;
 /// @param buf
 void diff_buf_delete(buf_T *buf)
 {
-  tabpage_T *tp;
-  for (tp = first_tabpage; tp != NULL; tp = tp->tp_next) {
+  FOR_ALL_TABS(tp) {
     int i = diff_buf_idx_tp(buf, tp);
 
     if (i != DB_COUNT) {
@@ -81,14 +86,14 @@ void diff_buf_adjust(win_T *win)
   if (!win->w_p_diff) {
     // When there is no window showing a diff for this buffer, remove
     // it from the diffs.
-    win_T *wp;
-    for (wp = firstwin; wp != NULL; wp = wp->w_next) {
+    bool found_win = false;
+    FOR_ALL_WINDOWS_IN_TAB(wp, curtab) {
       if ((wp->w_buffer == win->w_buffer) && wp->w_p_diff) {
-        break;
+        found_win = true;
       }
     }
 
-    if (wp == NULL) {
+    if (!found_win) {
       int i = diff_buf_idx(win->w_buffer);
       if (i != DB_COUNT) {
         curtab->tp_diffbuf[i] = NULL;
@@ -169,8 +174,7 @@ static int diff_buf_idx_tp(buf_T *buf, tabpage_T *tp)
 /// @param buf
 void diff_invalidate(buf_T *buf)
 {
-  tabpage_T *tp;
-  for (tp = first_tabpage; tp != NULL; tp = tp->tp_next) {
+  FOR_ALL_TABS(tp) {
     int i = diff_buf_idx_tp(buf, tp);
     if (i != DB_COUNT) {
       tp->tp_diff_invalid = TRUE;
@@ -191,8 +195,7 @@ void diff_mark_adjust(linenr_T line1, linenr_T line2, long amount,
                       long amount_after)
 {
   // Handle all tab pages that use the current buffer in a diff.
-  tabpage_T *tp;
-  for (tp = first_tabpage; tp != NULL; tp = tp->tp_next) {
+  FOR_ALL_TABS(tp) {
     int idx = diff_buf_idx_tp(curbuf, tp);
     if (idx != DB_COUNT) {
       diff_mark_adjust_tp(tp, idx, line1, line2, amount, amount_after);
@@ -575,8 +578,7 @@ static int diff_check_sanity(tabpage_T *tp, diff_T *dp)
 /// @param dofold Also recompute the folds
 static void diff_redraw(int dofold)
 {
-  win_T *wp;
-  for (wp = firstwin; wp != NULL; wp = wp->w_next) {
+  FOR_ALL_WINDOWS_IN_TAB(wp, curtab) {
     if (wp->w_p_diff) {
       redraw_win_later(wp, SOME_VALID);
       if (dofold && foldmethodIsDiff(wp)) {
@@ -593,6 +595,7 @@ static void diff_redraw(int dofold)
         } else if ((n > 0) && (n > wp->w_topfill)) {
           wp->w_topfill = n;
         }
+        check_topfill(wp, FALSE);
       }
     }
   }
@@ -655,9 +658,9 @@ void ex_diffupdate(exarg_T *eap)
   }
 
   // We need three temp file names.
-  char_u *tmp_orig = vim_tempname('o');
-  char_u *tmp_new = vim_tempname('n');
-  char_u *tmp_diff = vim_tempname('d');
+  char_u *tmp_orig = vim_tempname();
+  char_u *tmp_new = vim_tempname();
+  char_u *tmp_diff = vim_tempname();
 
   if ((tmp_orig == NULL) || (tmp_new == NULL) || (tmp_diff == NULL)) {
     goto theend;
@@ -846,9 +849,9 @@ void ex_diffpatch(exarg_T *eap)
 #endif  // ifdef UNIX
   // We need two temp file names.
   // Name of original temp file.
-  char_u *tmp_orig = vim_tempname('o');
+  char_u *tmp_orig = vim_tempname();
   // Name of patched temp file.
-  char_u *tmp_new = vim_tempname('n');
+  char_u *tmp_new = vim_tempname();
 
   if ((tmp_orig == NULL) || (tmp_new == NULL)) {
     goto theend;
@@ -887,15 +890,11 @@ void ex_diffpatch(exarg_T *eap)
       || (os_chdir((char *)dirbuf) != 0)) {
     dirbuf[0] = NUL;
   } else {
-# ifdef TEMPDIRNAMES
-    if (vim_tempdir != NULL) {
-      ignored = os_chdir((char *)vim_tempdir);
-    } else {
-      ignored = os_chdir("/tmp");
+    char *tempdir = (char *)vim_gettempdir();
+    if (tempdir == NULL) {
+      tempdir = "/tmp";
     }
-# else
-    ignored = os_chdir("/tmp");
-# endif  // ifdef TEMPDIRNAMES
+    os_chdir(tempdir);
     shorten_fnames(TRUE);
   }
 #endif  // ifdef UNIX
@@ -944,9 +943,10 @@ void ex_diffpatch(exarg_T *eap)
   os_remove((char *)buf);
 
   // Only continue if the output file was created.
-  off_t file_size;
-  bool file_size_success = os_get_file_size((char *)tmp_new, &file_size);
-  if (!file_size_success || file_size == 0) {
+  FileInfo file_info;
+  bool info_ok = os_fileinfo((char *)tmp_new, &file_info);
+  uint64_t filesize = os_fileinfo_size(&file_info);
+  if (!info_ok || filesize == 0) {
     EMSG(_("E816: Cannot read patch output"));
   } else {
     if (curbuf->b_fname != NULL) {
@@ -1107,8 +1107,7 @@ void ex_diffoff(exarg_T *eap)
   win_T *old_curwin = curwin;
   int diffwin = FALSE;
 
-  win_T *wp;
-  for (wp = firstwin; wp != NULL; wp = wp->w_next) {
+  FOR_ALL_WINDOWS_IN_TAB(wp, curtab) {
     if (eap->forceit ? wp->w_p_diff : (wp == curwin)) {
       // Set 'diff', 'scrollbind' off and 'wrap' on. If option values
       // were saved in diff_win_options() restore them.
@@ -1762,7 +1761,7 @@ void diff_set_topline(win_T *fromwin, win_T *towin)
   invalidate_botline_win(towin);
   changed_line_abv_curs_win(towin);
 
-  check_topfill(towin, FALSE);
+  check_topfill(towin, false);
   (void)hasFoldingWin(towin, towin->w_topline, &towin->w_topline,
                       NULL, TRUE, NULL);
 }
@@ -1817,8 +1816,7 @@ int diffopt_changed(void)
 
   // If "icase" or "iwhite" was added or removed, need to update the diff.
   if (diff_flags != diff_flags_new) {
-    tabpage_T *tp;
-    for (tp = first_tabpage; tp != NULL; tp = tp->tp_next) {
+    FOR_ALL_TABS(tp) {
       tp->tp_diff_invalid = TRUE;
     }
   }
@@ -2360,10 +2358,8 @@ void ex_diffgetput(exarg_T *eap)
 /// @param skip_idx
 static void diff_fold_update(diff_T *dp, int skip_idx)
 {
-  win_T *wp;
-  for (wp = firstwin; wp != NULL; wp = wp->w_next) {
-    int i;
-    for (i = 0; i < DB_COUNT; ++i) {
+  FOR_ALL_WINDOWS_IN_TAB(wp, curtab) {
+    for (int i = 0; i < DB_COUNT; ++i) {
       if ((curtab->tp_diffbuf[i] == wp->w_buffer) && (i != skip_idx)) {
         foldUpdate(wp, dp->df_lnum[i], dp->df_lnum[i] + dp->df_count[i]);
       }
@@ -2376,15 +2372,14 @@ static void diff_fold_update(diff_T *dp, int skip_idx)
 /// @param buf The buffer to check.
 ///
 /// @return TRUE if buffer "buf" is in diff-mode.
-int diff_mode_buf(buf_T *buf)
+bool diff_mode_buf(buf_T *buf)
 {
-  tabpage_T *tp;
-  for (tp = first_tabpage; tp != NULL; tp = tp->tp_next) {
+  FOR_ALL_TABS(tp) {
     if (diff_buf_idx_tp(buf, tp) != DB_COUNT) {
-      return TRUE;
+      return true;
     }
   }
-  return FALSE;
+  return false;
 }
 
 /// Move "count" times in direction "dir" to the next diff block.

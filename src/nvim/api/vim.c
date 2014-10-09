@@ -1,24 +1,29 @@
+#include <assert.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "nvim/api/vim.h"
+#include "nvim/ascii.h"
 #include "nvim/api/private/helpers.h"
 #include "nvim/api/private/defs.h"
 #include "nvim/api/buffer.h"
 #include "nvim/os/channel.h"
+#include "nvim/os/provider.h"
 #include "nvim/vim.h"
 #include "nvim/buffer.h"
 #include "nvim/window.h"
 #include "nvim/types.h"
-#include "nvim/ascii.h"
 #include "nvim/ex_docmd.h"
 #include "nvim/screen.h"
 #include "nvim/memory.h"
 #include "nvim/message.h"
 #include "nvim/eval.h"
 #include "nvim/misc2.h"
+#include "nvim/term.h"
+#include "nvim/getchar.h"
 
 #define LINE_BUFFER_SIZE 4096
 
@@ -47,6 +52,57 @@ void vim_command(String str, Error *err)
   try_end(err);
 }
 
+/// Pass input keys to Neovim
+///
+/// @param keys to be typed
+/// @param mode specifies the mapping options
+/// @see feedkeys()
+void vim_feedkeys(String keys, String mode)
+{
+  bool remap = true;
+  bool typed = false;
+
+  if (keys.size == 0) {
+    return;
+  }
+
+  for (size_t i = 0; i < mode.size; ++i) {
+    switch (mode.data[i]) {
+    case 'n': remap = false; break;
+    case 'm': remap = true; break;
+    case 't': typed = true; break;
+    }
+  }
+
+  /* Need to escape K_SPECIAL and CSI before putting the string in the
+   * typeahead buffer. */
+  char *keys_esc = (char *)vim_strsave_escape_csi((char_u *)keys.data);
+  ins_typebuf((char_u *)keys_esc, (remap ? REMAP_YES : REMAP_NONE),
+      typebuf.tb_len, !typed, false);
+  free(keys_esc);
+
+  if (vgetc_busy)
+    typebuf_was_filled = true;
+}
+
+/// Replace any terminal codes with the internal representation
+///
+/// @see replace_termcodes
+/// @see cpoptions
+String vim_replace_termcodes(String str, Boolean from_part, Boolean do_lt,
+                              Boolean special)
+{
+  if (str.size == 0) {
+    // Empty string
+    return str;
+  }
+
+  char *ptr = NULL;
+  replace_termcodes((char_u *)str.data, (char_u **)&ptr,
+                                            from_part, do_lt, special);
+  return cstr_as_string(ptr);
+}
+
 /// Evaluates the expression str using the vim internal expression
 /// evaluator (see |expression|).
 /// Dictionaries and lists are recursively expanded.
@@ -62,7 +118,7 @@ Object vim_eval(String str, Error *err)
   typval_T *expr_result = eval_expr((char_u *) str.data, NULL);
 
   if (!expr_result) {
-    set_api_error("Failed to eval expression", err);
+    api_set_error(err, Exception, _("Failed to evaluate expression"));
   }
 
   if (!try_end(err)) {
@@ -84,7 +140,7 @@ Object vim_eval(String str, Error *err)
 Integer vim_strwidth(String str, Error *err)
 {
   if (str.size > INT_MAX) {
-    set_api_error("String length is too high", err);
+    api_set_error(err, Validation, _("String length is too high"));
     return 0;
   }
 
@@ -94,9 +150,9 @@ Integer vim_strwidth(String str, Error *err)
 /// Returns a list of paths contained in 'runtimepath'
 ///
 /// @return The list of paths
-StringArray vim_list_runtime_paths(void)
+ArrayOf(String) vim_list_runtime_paths(void)
 {
-  StringArray rv = ARRAY_DICT_INIT;
+  Array rv = ARRAY_DICT_INIT;
   uint8_t *rtp = p_rtp;
 
   if (*rtp == NUL) {
@@ -113,19 +169,20 @@ StringArray vim_list_runtime_paths(void)
   }
 
   // Allocate memory for the copies
-  rv.items = xmalloc(sizeof(String) * rv.size);
+  rv.items = xmalloc(sizeof(Object) * rv.size);
   // reset the position
   rtp = p_rtp;
   // Start copying
   for (size_t i = 0; i < rv.size && *rtp != NUL; i++) {
-    rv.items[i].data = xmalloc(MAXPATHL);
+    rv.items[i].type = kObjectTypeString;
+    rv.items[i].data.string.data = xmalloc(MAXPATHL);
     // Copy the path from 'runtimepath' to rv.items[i]
     int length = copy_option_part(&rtp,
-                                 (char_u *)rv.items[i].data,
+                                 (char_u *)rv.items[i].data.string.data,
                                  MAXPATHL,
                                  ",");
     assert(length >= 0);
-    rv.items[i].size = (size_t)length;
+    rv.items[i].data.string.size = (size_t)length;
   }
 
   return rv;
@@ -138,7 +195,7 @@ StringArray vim_list_runtime_paths(void)
 void vim_change_directory(String dir, Error *err)
 {
   if (dir.size >= MAXPATHL) {
-    set_api_error("directory string is too long", err);
+    api_set_error(err, Validation, _("Directory string is too long"));
     return;
   }
 
@@ -150,7 +207,7 @@ void vim_change_directory(String dir, Error *err)
 
   if (vim_chdir((char_u *)string)) {
     if (!try_end(err)) {
-      set_api_error("failed to change directory", err);
+      api_set_error(err, Exception, _("Failed to change directory"));
     }
     return;
   }
@@ -252,12 +309,22 @@ void vim_err_write(String str)
   write_msg(str, true);
 }
 
+/// Higher level error reporting function that ensures all str contents
+/// are written by sending a trailing linefeed to `vim_wrr_write`
+///
+/// @param str The message
+void vim_report_error(String str)
+{
+  vim_err_write(str);
+  vim_err_write((String) {.data = "\n", .size = 1});
+}
+
 /// Gets the current list of buffer handles
 ///
 /// @return The number of buffers
-BufferArray vim_get_buffers(void)
+ArrayOf(Buffer) vim_get_buffers(void)
 {
-  BufferArray rv = ARRAY_DICT_INIT;
+  Array rv = ARRAY_DICT_INIT;
   buf_T *b = firstbuf;
 
   while (b) {
@@ -265,12 +332,12 @@ BufferArray vim_get_buffers(void)
     b = b->b_next;
   }
 
-  rv.items = xmalloc(sizeof(Buffer) * rv.size);
+  rv.items = xmalloc(sizeof(Object) * rv.size);
   size_t i = 0;
   b = firstbuf;
 
   while (b) {
-    rv.items[i++] = b->handle;
+    rv.items[i++] = BUFFER_OBJ(b->handle);
     b = b->b_next;
   }
 
@@ -298,38 +365,31 @@ void vim_set_current_buffer(Buffer buffer, Error *err)
   }
 
   try_start();
-  if (do_buffer(DOBUF_GOTO, DOBUF_FIRST, FORWARD, buf->b_fnum, 0) == FAIL) {
-    if (try_end(err)) {
-      return;
-    }
-
-    char msg[256];
-    snprintf(msg, sizeof(msg), "failed to switch to buffer %d", (int)buffer);
-    set_api_error(msg, err);
-    return;
+  int result = do_buffer(DOBUF_GOTO, DOBUF_FIRST, FORWARD, buf->b_fnum, 0);
+  if (!try_end(err) && result == FAIL) {
+    api_set_error(err,
+                  Exception,
+                  _("Failed to switch to buffer %" PRIu64),
+                  buffer);
   }
-
-  try_end(err);
 }
 
 /// Gets the current list of window handles
 ///
 /// @return The number of windows
-WindowArray vim_get_windows(void)
+ArrayOf(Window) vim_get_windows(void)
 {
-  WindowArray rv = ARRAY_DICT_INIT;
-  tabpage_T *tp;
-  win_T *wp;
+  Array rv = ARRAY_DICT_INIT;
 
   FOR_ALL_TAB_WINDOWS(tp, wp) {
     rv.size++;
   }
 
-  rv.items = xmalloc(sizeof(Window) * rv.size);
+  rv.items = xmalloc(sizeof(Object) * rv.size);
   size_t i = 0;
 
   FOR_ALL_TAB_WINDOWS(tp, wp) {
-    rv.items[i++] = wp->handle;
+    rv.items[i++] = WINDOW_OBJ(wp->handle);
   }
 
   return rv;
@@ -356,24 +416,20 @@ void vim_set_current_window(Window window, Error *err)
 
   try_start();
   goto_tabpage_win(win_find_tabpage(win), win);
-
-  if (win != curwin) {
-    if (try_end(err)) {
-      return;
-    }
-    set_api_error("did not switch to the specified window", err);
-    return;
+  if (!try_end(err) && win != curwin) {
+    api_set_error(err,
+                  Exception,
+                  _("Failed to switch to window %" PRIu64),
+                  window);
   }
-
-  try_end(err);
 }
 
 /// Gets the current list of tabpage handles
 ///
 /// @return The number of tab pages
-TabpageArray vim_get_tabpages(void)
+ArrayOf(Tabpage) vim_get_tabpages(void)
 {
-  TabpageArray rv = ARRAY_DICT_INIT;
+  Array rv = ARRAY_DICT_INIT;
   tabpage_T *tp = first_tabpage;
 
   while (tp) {
@@ -381,12 +437,12 @@ TabpageArray vim_get_tabpages(void)
     tp = tp->tp_next;
   }
 
-  rv.items = xmalloc(sizeof(Tabpage) * rv.size);
+  rv.items = xmalloc(sizeof(Object) * rv.size);
   size_t i = 0;
   tp = first_tabpage;
 
   while (tp) {
-    rv.items[i++] = tp->handle;
+    rv.items[i++] = TABPAGE_OBJ(tp->handle);
     tp = tp->tp_next;
   }
 
@@ -415,7 +471,12 @@ void vim_set_current_tabpage(Tabpage tabpage, Error *err)
 
   try_start();
   goto_tabpage_tp(tp, true, true);
-  try_end(err);
+  if (!try_end(err) && tp != curtab) {
+    api_set_error(err,
+                  Exception,
+                  _("Failed to switch to tabpage %" PRIu64),
+                  tabpage);
+  }
 }
 
 /// Subscribes to event broadcasts
@@ -446,6 +507,33 @@ void vim_unsubscribe(uint64_t channel_id, String event)
   channel_unsubscribe(channel_id, e);
 }
 
+/// Registers the channel as the provider for `feature`. This fails if
+/// a provider for `feature` is already provided by another channel.
+///
+/// @param channel_id The channel id
+/// @param feature The feature name
+/// @param[out] err Details of an error that may have occurred
+void vim_register_provider(uint64_t channel_id, String feature, Error *err)
+{
+  char buf[METHOD_MAXLEN];
+  xstrlcpy(buf, feature.data, sizeof(buf));
+
+  if (!provider_register(buf, channel_id)) {
+    api_set_error(err, Validation, _("Feature doesn't exist"));
+  }
+}
+
+Array vim_get_api_info(uint64_t channel_id)
+{
+  Array rv = ARRAY_DICT_INIT;
+
+  assert(channel_id <= INT64_MAX);
+  ADD(rv, INTEGER_OBJ((int64_t)channel_id));
+  ADD(rv, DICTIONARY_OBJ(api_metadata()));
+
+  return rv;
+}
+
 /// Writes a message to vim output or error buffer. The string is split
 /// and flushed after each newline. Incomplete lines are kept for writing
 /// later.
@@ -455,23 +543,24 @@ void vim_unsubscribe(uint64_t channel_id, String event)
 ///        `emsg` instead of `msg` to print each line)
 static void write_msg(String message, bool to_err)
 {
-  static int pos = 0;
-  static char line_buf[LINE_BUFFER_SIZE];
+  static int out_pos = 0, err_pos = 0;
+  static char out_line_buf[LINE_BUFFER_SIZE], err_line_buf[LINE_BUFFER_SIZE];
+
+#define PUSH_CHAR(i, pos, line_buf, msg)                                      \
+  if (message.data[i] == NL || pos == LINE_BUFFER_SIZE - 1) {                 \
+    line_buf[pos] = NUL;                                                      \
+    msg((uint8_t *)line_buf);                                                 \
+    pos = 0;                                                                  \
+    continue;                                                                 \
+  }                                                                           \
+                                                                              \
+  line_buf[pos++] = message.data[i];
 
   for (uint32_t i = 0; i < message.size; i++) {
-    if (message.data[i] == NL || pos == LINE_BUFFER_SIZE - 1) {
-      // Flush line
-      line_buf[pos] = NUL;
-      if (to_err) {
-        emsg((uint8_t *)line_buf);
-      } else {
-        msg((uint8_t *)line_buf);
-      }
-
-      pos = 0;
-      continue;
+    if (to_err) {
+      PUSH_CHAR(i, err_pos, err_line_buf, emsg);
+    } else {
+      PUSH_CHAR(i, out_pos, out_line_buf, msg);
     }
-
-    line_buf[pos++] = message.data[i];
   }
 }
