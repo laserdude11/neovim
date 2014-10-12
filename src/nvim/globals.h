@@ -61,17 +61,18 @@
 
 /*
  * Number of Rows and Columns in the screen.
+ * ///// Is the below line even relevant? Most of the options are char_u.
  * Must be long to be able to use them as options in option.c.
  * Note: Use screen_Rows and screen_Columns to access items in ScreenLines[].
  * They may have different values when the screen wasn't (re)allocated yet
  * after setting Rows or Columns (e.g., when starting up).
  */
-EXTERN long Rows                        /* nr of rows in the screen */
+EXTERN int Rows                        /* nr of rows in the screen */
 #ifdef DO_INIT
-  = 24L
+  = 24
 #endif
 ;
-EXTERN long Columns INIT(= 80);         /* nr of columns in the screen */
+EXTERN int Columns INIT(= 80);         /* nr of columns in the screen */
 
 /*
  * The characters and attributes cached for the screen.
