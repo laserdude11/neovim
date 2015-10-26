@@ -1,3 +1,4 @@
+local assert = require('luassert')
 local ffi = require('ffi')
 local formatc = require('test.unit.formatc')
 local Set = require('test.unit.set')
@@ -23,6 +24,10 @@ end
 
 if imported == nil then
   imported = Set:new()
+end
+
+if pragma_pack_id == nil then
+  pragma_pack_id = 1
 end
 
 -- some things are just too complex for the LuaJIT C parser to digest. We
@@ -62,7 +67,7 @@ local function cimport(...)
   end
 
   local body = nil
-  for i=1, 3 do
+  for i=1, 10 do
     local stream = Preprocess.preprocess_stream(unpack(paths))
     body = stream:read("*a")
     stream:close()
@@ -81,7 +86,16 @@ local function cimport(...)
   -- add the formatted lines to a set
   local new_cdefs = Set:new()
   for line in body:gmatch("[^\r\n]+") do
-    new_cdefs:add(trim(line))
+    line = trim(line)
+    -- give each #pragma pack an unique id, so that they don't get removed
+    -- if they are inserted into the set
+    -- (they are needed in the right order with the struct definitions,
+    -- otherwise luajit has wrong memory layouts for the sturcts)
+    if line:match("#pragma%s+pack") then
+      line = line .. " // " .. pragma_pack_id
+      pragma_pack_id = pragma_pack_id + 1
+    end
+    new_cdefs:add(line)
   end
 
   -- subtract the lines we've already imported from the new lines, then add
@@ -122,31 +136,11 @@ end
 
 -- initialize some global variables, this is still necessary to unit test
 -- functions that rely on global state.
-local function vim_init()
-  if vim_init_called ~= nil then
-    return 
-  end
-  -- import os_unix.h for mch_early_init(), which initializes some globals
-  local all = cimport('./src/nvim/os_unix.h',
-                      './src/nvim/misc1.h',
-                      './src/nvim/eval.h',
-                      './src/nvim/os_unix.h',
-                      './src/nvim/option.h',
-                      './src/nvim/ex_cmds2.h',
-                      './src/nvim/window.h',
-                      './src/nvim/ops.h',
-                      './src/nvim/normal.h',
-                      './src/nvim/mbyte.h')
-  all.mch_early_init()
-  all.mb_init()
-  all.eval_init()
-  all.init_normal_cmds()
-  all.win_alloc_first()
-  all.init_yank()
-  all.init_homedir()
-  all.set_init_1()
-  all.set_lang_var()
-  vim_init_called = true
+do
+  local main = cimport('./src/nvim/main.h')
+  local time = cimport('./src/nvim/os/time.h')
+  time.time_init()
+  main.early_init()
 end
 
 -- C constants.
@@ -169,7 +163,6 @@ return {
   lib = libnvim,
   cstr = cstr,
   to_cstr = to_cstr,
-  vim_init = vim_init,
   NULL = NULL,
   OK = OK,
   FAIL = FAIL

@@ -4,14 +4,14 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
 #include "nvim/api/vim.h"
 #include "nvim/ascii.h"
 #include "nvim/api/private/helpers.h"
 #include "nvim/api/private/defs.h"
 #include "nvim/api/buffer.h"
-#include "nvim/os/channel.h"
-#include "nvim/os/provider.h"
+#include "nvim/msgpack_rpc/channel.h"
 #include "nvim/vim.h"
 #include "nvim/buffer.h"
 #include "nvim/window.h"
@@ -22,22 +22,15 @@
 #include "nvim/message.h"
 #include "nvim/eval.h"
 #include "nvim/misc2.h"
-#include "nvim/term.h"
+#include "nvim/syntax.h"
 #include "nvim/getchar.h"
+#include "nvim/os/input.h"
 
 #define LINE_BUFFER_SIZE 4096
 
 #ifdef INCLUDE_GENERATED_DECLARATIONS
 # include "api/vim.c.generated.h"
 #endif
-
-/// Send keys to vim input buffer, simulating user input.
-///
-/// @param str The keys to send
-void vim_push_keys(String str)
-{
-  abort();
-}
 
 /// Executes an ex-mode command str
 ///
@@ -47,19 +40,22 @@ void vim_command(String str, Error *err)
 {
   // Run the command
   try_start();
-  do_cmdline_cmd((char_u *) str.data);
+  do_cmdline_cmd(str.data);
   update_screen(VALID);
   try_end(err);
 }
 
-/// Pass input keys to Neovim
+/// Passes input keys to Neovim
 ///
 /// @param keys to be typed
 /// @param mode specifies the mapping options
+/// @param escape_csi the string needs escaping for K_SPECIAL/CSI bytes
 /// @see feedkeys()
-void vim_feedkeys(String keys, String mode)
+/// @see vim_strsave_escape_csi
+void vim_feedkeys(String keys, String mode, Boolean escape_csi)
 {
   bool remap = true;
+  bool insert = false;
   bool typed = false;
 
   if (keys.size == 0) {
@@ -71,21 +67,43 @@ void vim_feedkeys(String keys, String mode)
     case 'n': remap = false; break;
     case 'm': remap = true; break;
     case 't': typed = true; break;
+    case 'i': insert = true; break;
     }
   }
 
-  /* Need to escape K_SPECIAL and CSI before putting the string in the
-   * typeahead buffer. */
-  char *keys_esc = (char *)vim_strsave_escape_csi((char_u *)keys.data);
+  char *keys_esc;
+  if (escape_csi) {
+      // Need to escape K_SPECIAL and CSI before putting the string in the
+      // typeahead buffer.
+      keys_esc = (char *)vim_strsave_escape_csi((char_u *)keys.data);
+  } else {
+      keys_esc = keys.data;
+  }
   ins_typebuf((char_u *)keys_esc, (remap ? REMAP_YES : REMAP_NONE),
-      typebuf.tb_len, !typed, false);
-  free(keys_esc);
+      insert ? 0 : typebuf.tb_len, !typed, false);
+
+  if (escape_csi) {
+      xfree(keys_esc);
+  }
 
   if (vgetc_busy)
     typebuf_was_filled = true;
 }
 
-/// Replace any terminal codes with the internal representation
+/// Passes input keys to Neovim. Unlike `vim_feedkeys`, this will use a
+/// lower-level input buffer and the call is not deferred.
+/// This is the most reliable way to emulate real user input.
+///
+/// @param keys to be typed
+/// @return The number of bytes actually written, which can be lower than
+///         requested if the buffer becomes full.
+Integer vim_input(String keys)
+  FUNC_ATTR_ASYNC
+{
+  return (Integer)input_enqueue(keys);
+}
+
+/// Replaces any terminal codes with the internal representation
 ///
 /// @see replace_termcodes
 /// @see cpoptions
@@ -103,7 +121,20 @@ String vim_replace_termcodes(String str, Boolean from_part, Boolean do_lt,
   return cstr_as_string(ptr);
 }
 
-/// Evaluates the expression str using the vim internal expression
+String vim_command_output(String str, Error *err)
+{
+  do_cmdline_cmd("redir => v:command_output");
+  vim_command(str, err);
+  do_cmdline_cmd("redir END");
+
+  if (err->set) {
+    return (String) STRING_INIT;
+  }
+
+  return cstr_to_string((char *)get_vim_var_str(VV_COMMAND_OUTPUT));
+}
+
+/// Evaluates the expression str using the Vim internal expression
 /// evaluator (see |expression|).
 /// Dictionaries and lists are recursively expanded.
 ///
@@ -112,7 +143,7 @@ String vim_replace_termcodes(String str, Boolean from_part, Boolean do_lt,
 /// @return The expanded object
 Object vim_eval(String str, Error *err)
 {
-  Object rv;
+  Object rv = OBJECT_INIT;
   // Evaluate the expression
   try_start();
   typval_T *expr_result = eval_expr((char_u *) str.data, NULL);
@@ -128,6 +159,55 @@ Object vim_eval(String str, Error *err)
 
   // Free the vim object
   free_tv(expr_result);
+  return rv;
+}
+
+/// Call the given function with the given arguments stored in an array.
+///
+/// @param fname Function to call
+/// @param args Functions arguments packed in an Array
+/// @param[out] err Details of an error that may have occurred
+/// @return Result of the function call
+Object vim_call_function(String fname, Array args, Error *err)
+{
+  Object rv = OBJECT_INIT;
+  if (args.size > MAX_FUNC_ARGS) {
+    api_set_error(err, Validation,
+      _("Function called with too many arguments."));
+    return rv;
+  }
+
+  // Convert the arguments in args from Object to typval_T values
+  typval_T vim_args[MAX_FUNC_ARGS + 1];
+  size_t i = 0;  // also used for freeing the variables
+  for (; i < args.size; i++) {
+    if (!object_to_vim(args.items[i], &vim_args[i], err)) {
+      goto free_vim_args;
+    }
+  }
+
+  try_start();
+  // Call the function
+  typval_T rettv;
+  int dummy;
+  int r = call_func((char_u *) fname.data, (int) fname.size,
+                    &rettv, (int) args.size, vim_args,
+                    curwin->w_cursor.lnum, curwin->w_cursor.lnum, &dummy,
+                    true,
+                    NULL);
+  if (r == FAIL) {
+    api_set_error(err, Exception, _("Error calling function."));
+  }
+  if (!try_end(err)) {
+    rv = vim_to_object(&rettv);
+  }
+  clear_tv(&rettv);
+
+free_vim_args:
+  while (i > 0) {
+    clear_tv(&vim_args[--i]);
+  }
+
   return rv;
 }
 
@@ -147,7 +227,7 @@ Integer vim_strwidth(String str, Error *err)
   return (Integer) mb_string2cells((char_u *) str.data);
 }
 
-/// Returns a list of paths contained in 'runtimepath'
+/// Gets a list of paths contained in 'runtimepath'
 ///
 /// @return The list of paths
 ArrayOf(String) vim_list_runtime_paths(void)
@@ -170,25 +250,24 @@ ArrayOf(String) vim_list_runtime_paths(void)
 
   // Allocate memory for the copies
   rv.items = xmalloc(sizeof(Object) * rv.size);
-  // reset the position
+  // Reset the position
   rtp = p_rtp;
   // Start copying
   for (size_t i = 0; i < rv.size && *rtp != NUL; i++) {
     rv.items[i].type = kObjectTypeString;
     rv.items[i].data.string.data = xmalloc(MAXPATHL);
     // Copy the path from 'runtimepath' to rv.items[i]
-    int length = copy_option_part(&rtp,
-                                 (char_u *)rv.items[i].data.string.data,
-                                 MAXPATHL,
-                                 ",");
-    assert(length >= 0);
-    rv.items[i].data.string.size = (size_t)length;
+    size_t length = copy_option_part(&rtp,
+                                     (char_u *)rv.items[i].data.string.data,
+                                     MAXPATHL,
+                                     ",");
+    rv.items[i].data.string.size = length;
   }
 
   return rv;
 }
 
-/// Changes vim working directory
+/// Changes Vim working directory
 ///
 /// @param dir The new working directory
 /// @param[out] err Details of an error that may have occurred
@@ -216,7 +295,7 @@ void vim_change_directory(String dir, Error *err)
   try_end(err);
 }
 
-/// Return the current line
+/// Gets the current line
 ///
 /// @param[out] err Details of an error that may have occurred
 /// @return The current line string
@@ -234,7 +313,7 @@ void vim_set_current_line(String line, Error *err)
   buffer_set_line(curbuf->handle, curwin->w_cursor.lnum - 1, line, err);
 }
 
-/// Delete the current line
+/// Deletes the current line
 ///
 /// @param[out] err Details of an error that may have occurred
 void vim_del_current_line(Error *err)
@@ -273,7 +352,7 @@ Object vim_get_vvar(String name, Error *err)
   return dict_get_value(&vimvardict, name, err);
 }
 
-/// Get an option value string
+/// Gets an option value string
 ///
 /// @param name The option name
 /// @param[out] err Details of an error that may have occurred
@@ -293,7 +372,7 @@ void vim_set_option(String name, Object value, Error *err)
   set_option_to(NULL, SREQ_GLOBAL, name, value, err);
 }
 
-/// Write a message to vim output buffer
+/// Writes a message to vim output buffer
 ///
 /// @param str The message
 void vim_out_write(String str)
@@ -301,7 +380,7 @@ void vim_out_write(String str)
   write_msg(str, false);
 }
 
-/// Write a message to vim error buffer
+/// Writes a message to vim error buffer
 ///
 /// @param str The message
 void vim_err_write(String str)
@@ -310,7 +389,7 @@ void vim_err_write(String str)
 }
 
 /// Higher level error reporting function that ensures all str contents
-/// are written by sending a trailing linefeed to `vim_wrr_write`
+/// are written by sending a trailing linefeed to `vim_err_write`
 ///
 /// @param str The message
 void vim_report_error(String str)
@@ -325,26 +404,22 @@ void vim_report_error(String str)
 ArrayOf(Buffer) vim_get_buffers(void)
 {
   Array rv = ARRAY_DICT_INIT;
-  buf_T *b = firstbuf;
 
-  while (b) {
+  FOR_ALL_BUFFERS(b) {
     rv.size++;
-    b = b->b_next;
   }
 
   rv.items = xmalloc(sizeof(Object) * rv.size);
   size_t i = 0;
-  b = firstbuf;
 
-  while (b) {
+  FOR_ALL_BUFFERS(b) {
     rv.items[i++] = BUFFER_OBJ(b->handle);
-    b = b->b_next;
   }
 
   return rv;
 }
 
-/// Return the current buffer
+/// Gets the current buffer
 ///
 /// @reqturn The buffer handle
 Buffer vim_get_current_buffer(void)
@@ -395,7 +470,7 @@ ArrayOf(Window) vim_get_windows(void)
   return rv;
 }
 
-/// Return the current window
+/// Gets the current window
 ///
 /// @return The window handle
 Window vim_get_current_window(void)
@@ -430,26 +505,22 @@ void vim_set_current_window(Window window, Error *err)
 ArrayOf(Tabpage) vim_get_tabpages(void)
 {
   Array rv = ARRAY_DICT_INIT;
-  tabpage_T *tp = first_tabpage;
 
-  while (tp) {
+  FOR_ALL_TABS(tp) {
     rv.size++;
-    tp = tp->tp_next;
   }
 
   rv.items = xmalloc(sizeof(Object) * rv.size);
   size_t i = 0;
-  tp = first_tabpage;
 
-  while (tp) {
+  FOR_ALL_TABS(tp) {
     rv.items[i++] = TABPAGE_OBJ(tp->handle);
-    tp = tp->tp_next;
   }
 
   return rv;
 }
 
-/// Return the current tab page
+/// Gets the current tab page
 ///
 /// @return The tab page handle
 Tabpage vim_get_current_tabpage(void)
@@ -481,7 +552,7 @@ void vim_set_current_tabpage(Tabpage tabpage, Error *err)
 
 /// Subscribes to event broadcasts
 ///
-/// @param channel_id The channel id(passed automatically by the dispatcher)
+/// @param channel_id The channel id (passed automatically by the dispatcher)
 /// @param event The event type string
 void vim_subscribe(uint64_t channel_id, String event)
 {
@@ -494,7 +565,7 @@ void vim_subscribe(uint64_t channel_id, String event)
 
 /// Unsubscribes to event broadcasts
 ///
-/// @param channel_id The channel id(passed automatically by the dispatcher)
+/// @param channel_id The channel id (passed automatically by the dispatcher)
 /// @param event The event type string
 void vim_unsubscribe(uint64_t channel_id, String event)
 {
@@ -507,23 +578,25 @@ void vim_unsubscribe(uint64_t channel_id, String event)
   channel_unsubscribe(channel_id, e);
 }
 
-/// Registers the channel as the provider for `feature`. This fails if
-/// a provider for `feature` is already provided by another channel.
-///
-/// @param channel_id The channel id
-/// @param feature The feature name
-/// @param[out] err Details of an error that may have occurred
-void vim_register_provider(uint64_t channel_id, String feature, Error *err)
+Integer vim_name_to_color(String name)
 {
-  char buf[METHOD_MAXLEN];
-  xstrlcpy(buf, feature.data, sizeof(buf));
-
-  if (!provider_register(buf, channel_id)) {
-    api_set_error(err, Validation, _("Feature doesn't exist"));
-  }
+  return name_to_color((uint8_t *)name.data);
 }
 
+Dictionary vim_get_color_map(void)
+{
+  Dictionary colors = ARRAY_DICT_INIT;
+
+  for (int i = 0; color_name_table[i].name != NULL; i++) {
+    PUT(colors, color_name_table[i].name,
+        INTEGER_OBJ(color_name_table[i].color));
+  }
+  return colors;
+}
+
+
 Array vim_get_api_info(uint64_t channel_id)
+  FUNC_ATTR_ASYNC
 {
   Array rv = ARRAY_DICT_INIT;
 
@@ -539,11 +612,11 @@ Array vim_get_api_info(uint64_t channel_id)
 /// later.
 ///
 /// @param message The message to write
-/// @param to_err True if it should be treated as an error message(use
+/// @param to_err true if it should be treated as an error message (use
 ///        `emsg` instead of `msg` to print each line)
 static void write_msg(String message, bool to_err)
 {
-  static int out_pos = 0, err_pos = 0;
+  static size_t out_pos = 0, err_pos = 0;
   static char out_line_buf[LINE_BUFFER_SIZE], err_line_buf[LINE_BUFFER_SIZE];
 
 #define PUSH_CHAR(i, pos, line_buf, msg)                                      \
@@ -556,6 +629,7 @@ static void write_msg(String message, bool to_err)
                                                                               \
   line_buf[pos++] = message.data[i];
 
+  ++no_wait_return;
   for (uint32_t i = 0; i < message.size; i++) {
     if (to_err) {
       PUSH_CHAR(i, err_pos, err_line_buf, emsg);
@@ -563,4 +637,6 @@ static void write_msg(String message, bool to_err)
       PUSH_CHAR(i, out_pos, out_line_buf, msg);
     }
   }
+  --no_wait_return;
+  msg_end();
 }

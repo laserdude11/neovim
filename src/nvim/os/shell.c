@@ -1,4 +1,5 @@
 #include <string.h>
+#include <assert.h>
 #include <stdbool.h>
 #include <stdlib.h>
 
@@ -7,15 +8,16 @@
 #include "nvim/ascii.h"
 #include "nvim/lib/kvec.h"
 #include "nvim/log.h"
-#include "nvim/os/job.h"
-#include "nvim/os/rstream.h"
+#include "nvim/event/loop.h"
+#include "nvim/event/libuv_process.h"
+#include "nvim/event/rstream.h"
 #include "nvim/os/shell.h"
 #include "nvim/os/signal.h"
 #include "nvim/types.h"
 #include "nvim/vim.h"
 #include "nvim/message.h"
 #include "nvim/memory.h"
-#include "nvim/term.h"
+#include "nvim/ui.h"
 #include "nvim/misc2.h"
 #include "nvim/screen.h"
 #include "nvim/memline.h"
@@ -23,59 +25,45 @@
 #include "nvim/charset.h"
 #include "nvim/strings.h"
 
-#define BUFFER_LENGTH 1024
-
-typedef struct {
-  bool reading;
-  int old_state, old_mode, exit_status, exited;
-  char *wbuffer;
-  char rbuffer[BUFFER_LENGTH];
-  uv_buf_t bufs[2];
-  uv_stream_t *shell_stdin;
-  garray_T ga;
-} ProcessData;
+#define DYNAMIC_BUFFER_INIT {NULL, 0, 0}
 
 typedef struct {
   char *data;
-  size_t cap;
-  size_t len;
-} dyn_buffer_t;
+  size_t cap, len;
+} DynamicBuffer;
 
 #ifdef INCLUDE_GENERATED_DECLARATIONS
 # include "os/shell.c.generated.h"
 #endif
 
 
-// Callbacks for libuv
-
-/// Builds the argument vector for running the shell configured in `sh`
-/// ('shell' option), optionally with a command that will be passed with `shcf`
-/// ('shellcmdflag').
+/// Builds the argument vector for running the user-configured 'shell' (p_sh)
+/// with an optional command prefixed by 'shellcmdflag' (p_shcf).
 ///
-/// @param cmd Command string. If NULL it will run an interactive shell.
-/// @param extra_shell_opt Extra argument to the shell. If NULL it is ignored
+/// @param cmd Command string, or NULL to run an interactive shell.
+/// @param extra_args Extra arguments to the shell, or NULL.
 /// @return A newly allocated argument vector. It must be freed with
 ///         `shell_free_argv` when no longer needed.
-char **shell_build_argv(const char_u *cmd, const char_u *extra_shell_opt)
+char **shell_build_argv(const char *cmd, const char *extra_args)
 {
-  int argc = tokenize(p_sh, NULL) + tokenize(p_shcf, NULL);
+  size_t argc = tokenize(p_sh, NULL) + tokenize(p_shcf, NULL);
   char **rv = xmalloc((unsigned)((argc + 4) * sizeof(char *)));
 
   // Split 'shell'
-  int i = tokenize(p_sh, rv);
+  size_t i = tokenize(p_sh, rv);
 
-  if (extra_shell_opt != NULL) {
-    // Push a copy of `extra_shell_opt`
-    rv[i++] = xstrdup((char *)extra_shell_opt);
+  if (extra_args) {
+    rv[i++] = xstrdup(extra_args);   // Push a copy of `extra_args`
   }
 
-  if (cmd != NULL) {
-    // Split 'shellcmdflag'
-    i += tokenize(p_shcf, rv + i);
-    rv[i++] = xstrdup((char *)cmd);
+  if (cmd) {
+    i += tokenize(p_shcf, rv + i);   // Split 'shellcmdflag'
+    rv[i++] = xstrdup(cmd);          // Push a copy of the command.
   }
 
   rv[i] = NULL;
+
+  assert(rv[0]);
 
   return rv;
 }
@@ -94,153 +82,71 @@ void shell_free_argv(char **argv)
 
   while (*p != NULL) {
     // Free each argument
-    free(*p);
+    xfree(*p);
     p++;
   }
 
-  free(argv);
+  xfree(argv);
 }
 
-/// Calls the user shell for running a command, interactive session or
-/// wildcard expansion. It uses the shell set in the `sh` option.
+/// Calls the user-configured 'shell' (p_sh) for running a command or wildcard
+/// expansion.
 ///
-/// @param cmd The command to be executed. If NULL it will run an interactive
-///        shell
-/// @param opts Various options that control how the shell will work
-/// @param extra_shell_arg Extra argument to be passed to the shell
-int os_call_shell(char_u *cmd, ShellOpts opts, char_u *extra_shell_arg)
+/// @param cmd The command to execute, or NULL to run an interactive shell.
+/// @param opts Options that control how the shell will work.
+/// @param extra_args Extra arguments to the shell, or NULL.
+int os_call_shell(char_u *cmd, ShellOpts opts, char_u *extra_args)
 {
-  uv_stdio_container_t proc_stdio[3];
-  uv_process_options_t proc_opts;
-  uv_process_t proc;
-  uv_pipe_t proc_stdin, proc_stdout;
-  uv_write_t write_req;
-  int expected_exits = 1;
-  ProcessData pdata = {
-    .reading = false,
-    .exited = 0,
-    .old_mode = cur_tmode,
-    .old_state = State,
-    .shell_stdin = (uv_stream_t *)&proc_stdin,
-    .wbuffer = NULL,
-  };
-
-  out_flush();
-  if (opts & kShellOptCooked) {
-    // set to normal mode
-    settmode(TMODE_COOK);
-  }
+  DynamicBuffer input = DYNAMIC_BUFFER_INIT;
+  char *output = NULL, **output_ptr = NULL;
+  int current_state = State;
+  bool forward_output = true;
 
   // While the child is running, ignore terminating signals
   signal_reject_deadly();
 
-  // Create argv for `uv_spawn`
-  // TODO(tarruda): we can use a static buffer for small argument vectors. 1024
-  // bytes should be enough for most of the commands and if more is necessary
-  // we can allocate a another buffer
-  proc_opts.args = shell_build_argv(cmd, extra_shell_arg);
-  proc_opts.file = proc_opts.args[0];
-  proc_opts.exit_cb = exit_cb;
-  // Initialize libuv structures
-  proc_opts.stdio = proc_stdio;
-  proc_opts.stdio_count = 3;
-  // Hide window on Windows :)
-  proc_opts.flags = UV_PROCESS_WINDOWS_HIDE;
-  proc_opts.cwd = NULL;
-  proc_opts.env = NULL;
-
-  // The default is to inherit all standard file descriptors(this will change
-  // when the UI is moved to an external process)
-  proc_stdio[0].flags = UV_INHERIT_FD;
-  proc_stdio[0].data.fd = 0;
-  proc_stdio[1].flags = UV_INHERIT_FD;
-  proc_stdio[1].data.fd = 1;
-  proc_stdio[2].flags = UV_INHERIT_FD;
-  proc_stdio[2].data.fd = 2;
-
   if (opts & (kShellOptHideMess | kShellOptExpand)) {
-    // Ignore the shell stdio(redirects to /dev/null on unixes)
-    proc_stdio[0].flags = UV_IGNORE;
-    proc_stdio[1].flags = UV_IGNORE;
-    proc_stdio[2].flags = UV_IGNORE;
+    forward_output = false;
   } else {
     State = EXTERNCMD;
 
     if (opts & kShellOptWrite) {
-      // Write from the current buffer into the process stdin
-      uv_pipe_init(uv_default_loop(), &proc_stdin, 0);
-      write_req.data = &pdata;
-      proc_stdio[0].flags = UV_CREATE_PIPE | UV_READABLE_PIPE;
-      proc_stdio[0].data.stream = (uv_stream_t *)&proc_stdin;
+      read_input(&input);
     }
 
     if (opts & kShellOptRead) {
-      // Read from the process stdout into the current buffer
-      uv_pipe_init(uv_default_loop(), &proc_stdout, 0);
-      proc_stdout.data = &pdata;
-      proc_stdio[1].flags = UV_CREATE_PIPE | UV_WRITABLE_PIPE;
-      proc_stdio[1].data.stream = (uv_stream_t *)&proc_stdout;
-      ga_init(&pdata.ga, 1, BUFFER_LENGTH);
+      output_ptr = &output;
+      forward_output = false;
     }
   }
 
-  if (uv_spawn(uv_default_loop(), &proc, &proc_opts)) {
-    // Failed, probably due to `sh` not being executable
-    if (!emsg_silent) {
-      MSG_PUTS(_("\nCannot execute shell "));
-      msg_outtrans(p_sh);
-      msg_putchar('\n');
-    }
+  size_t nread;
 
-    return proc_cleanup_exit(&pdata, &proc_opts, opts);
+  int status = do_os_system(shell_build_argv((char *)cmd, (char *)extra_args),
+                            input.data,
+                            input.len,
+                            output_ptr,
+                            &nread,
+                            emsg_silent,
+                            forward_output);
+
+  xfree(input.data);
+
+  if (output) {
+    (void)write_output(output, nread, true, true);
+    xfree(output);
   }
 
-  // Assign the flag address after `proc` is initialized by `uv_spawn`
-  proc.data = &pdata;
-
-  if (opts & kShellOptWrite) {
-    // Queue everything for writing to the shell stdin
-    write_selection(&write_req);
-    expected_exits++;
+  if (!emsg_silent && status != 0 && !(opts & kShellOptSilent)) {
+    MSG_PUTS(_("\nshell returned "));
+    msg_outnum(status);
+    msg_putchar('\n');
   }
 
-  if (opts & kShellOptRead) {
-    // Start the read stream for the shell stdout
-    uv_read_start((uv_stream_t *)&proc_stdout, alloc_cb, read_cb);
-    expected_exits++;
-  }
+  State = current_state;
+  signal_accept_deadly();
 
-  // Keep running the loop until all three handles are completely closed
-  while (pdata.exited < expected_exits) {
-    uv_run(uv_default_loop(), UV_RUN_ONCE);
-
-    if (got_int) {
-      // Forward SIGINT to the shell
-      // TODO(tarruda): for now this is only needed if the terminal is in raw
-      // mode, but when the UI is externalized we'll also need it, so leave it
-      // here
-      uv_process_kill(&proc, SIGINT);
-      got_int = false;
-    }
-  }
-
-  if (opts & kShellOptRead) {
-    if (!GA_EMPTY(&pdata.ga)) {
-      // If there's an unfinished line in the growable array, append it now.
-      append_ga_line(&pdata.ga);
-      // remember that the NL was missing
-      curbuf->b_no_eol_lnum = curwin->w_cursor.lnum;
-    } else {
-      curbuf->b_no_eol_lnum = 0;
-    }
-    ga_clear(&pdata.ga);
-  }
-
-  if (opts & kShellOptWrite) {
-    free(pdata.wbuffer);
-  }
-
-  return proc_cleanup_exit(&pdata, &proc_opts, opts);
+  return status;
 }
 
 /// os_system - synchronously execute a command in the shell
@@ -248,86 +154,142 @@ int os_call_shell(char_u *cmd, ShellOpts opts, char_u *extra_shell_arg)
 /// example:
 ///   char *output = NULL;
 ///   size_t nread = 0;
-///   int status = os_sytem("ls -la", NULL, 0, &output, &nread);
+///   char *argv[] = {"ls", "-la", NULL};
+///   int status = os_sytem(argv, NULL, 0, &output, &nread);
 ///
-/// @param cmd The full commandline to be passed to the shell
+/// @param argv The commandline arguments to be passed to the shell. `argv`
+///             will be consumed.
 /// @param input The input to the shell (NULL for no input), passed to the
 ///              stdin of the resulting process.
 /// @param len The length of the input buffer (not used if `input` == NULL)
 /// @param[out] output A pointer to to a location where the output will be
 ///                    allocated and stored. Will point to NULL if the shell
-///                    command did not output anything. NOTE: it's not
-///                    allowed to pass NULL yet
+///                    command did not output anything. If NULL is passed,
+///                    the shell output will be ignored.
 /// @param[out] nread the number of bytes in the returned buffer (if the
 ///             returned buffer is not NULL)
 /// @return the return code of the process, -1 if the process couldn't be
 ///         started properly
-int os_system(const char *cmd,
+int os_system(char **argv,
               const char *input,
               size_t len,
               char **output,
-              size_t *nread) FUNC_ATTR_NONNULL_ARG(1, 4)
+              size_t *nread) FUNC_ATTR_NONNULL_ARG(1)
+{
+  return do_os_system(argv, input, len, output, nread, true, false);
+}
+
+static int do_os_system(char **argv,
+                        const char *input,
+                        size_t len,
+                        char **output,
+                        size_t *nread,
+                        bool silent,
+                        bool forward_output)
 {
   // the output buffer
-  dyn_buffer_t buf;
-  memset(&buf, 0, sizeof(buf));
+  DynamicBuffer buf = DYNAMIC_BUFFER_INIT;
+  stream_read_cb data_cb = system_data_cb;
+  if (nread) {
+    *nread = 0;
+  }
 
-  char **argv = shell_build_argv((char_u *) cmd, NULL);
+  if (forward_output) {
+    data_cb = out_data_cb;
+  } else if (!output) {
+    data_cb = NULL;
+  }
 
-  int i;
-  Job *job = job_start(argv,
-                       &buf,
-                       system_data_cb,
-                       system_data_cb,
-                       NULL,
-                       0,
-                       &i);
+  // Copy the program name in case we need to report an error.
+  char prog[MAXPATHL];
+  xstrlcpy(prog, argv[0], MAXPATHL);
 
-  if (i <= 0) {
-    // couldn't even start the job
-    ELOG("Couldn't start job, error code: '%d'", i);
+  Stream in, out, err;
+  LibuvProcess uvproc = libuv_process_init(&loop, &buf);
+  Process *proc = &uvproc.process;
+  Queue *events = queue_new_child(loop.events);
+  proc->events = events;
+  proc->argv = argv;
+  proc->in = input != NULL ? &in : NULL;
+  proc->out = &out;
+  proc->err = &err;
+  if (!process_spawn(proc)) {
+    loop_poll_events(&loop, 0);
+    // Failed, probably due to `sh` not being executable
+    if (!silent) {
+      MSG_PUTS(_("\nCannot execute "));
+      msg_outtrans((char_u *)prog);
+      msg_putchar('\n');
+    }
+    queue_free(events);
     return -1;
   }
+
+  // We want to deal with stream events as fast a possible while queueing
+  // process events, so reset everything to NULL. It prevents closing the
+  // streams while there's still data in the OS buffer(due to the process
+  // exiting before all data is read).
+  if (input != NULL) {
+    proc->in->events = NULL;
+    wstream_init(proc->in, 0);
+  }
+  proc->out->events = NULL;
+  rstream_init(proc->out, 0);
+  rstream_start(proc->out, data_cb);
+  proc->err->events = NULL;
+  rstream_init(proc->err, 0);
+  rstream_start(proc->err, data_cb);
 
   // write the input, if any
   if (input) {
     WBuffer *input_buffer = wstream_new_buffer((char *) input, len, 1, NULL);
 
-    if (!job_write(job, input_buffer)) {
-      // couldn't write, stop the job and tell the user about it
-      job_stop(job);
+    if (!wstream_write(&in, input_buffer)) {
+      // couldn't write, stop the process and tell the user about it
+      process_stop(proc);
       return -1;
+    }
+    // close the input stream after everything is written
+    wstream_set_write_cb(&in, shell_write_cb);
+  }
+
+  // invoke busy_start here so event_poll_until wont change the busy state for
+  // the UI
+  ui_busy_start();
+  ui_flush();
+  int status = process_wait(proc, -1, NULL);
+  ui_busy_stop();
+
+  // prepare the out parameters if requested
+  if (output) {
+    if (buf.len == 0) {
+      // no data received from the process, return NULL
+      *output = NULL;
+      xfree(buf.data);
+    } else {
+      // NUL-terminate to make the output directly usable as a C string
+      buf.data[buf.len] = NUL;
+      *output = buf.data;
+    }
+
+    if (nread) {
+      *nread = buf.len;
     }
   }
 
-  // close the input stream, let the process know that no more input is coming
-  job_close_in(job);
-  int status = job_wait(job, -1);
-
-  // prepare the out parameters if requested
-  if (buf.len == 0) {
-    // no data received from the process, return NULL
-    *output = NULL;
-    free(buf.data);
-  } else {
-    // NUL-terminate to make the output directly usable as a C string
-    buf.data[buf.len] = NUL;
-    *output = buf.data;
-  }
-
-  if (nread) {
-    *nread = buf.len;
-  }
+  assert(queue_empty(events));
+  queue_free(events);
 
   return status;
 }
 
-/// dyn_buf_ensure - ensures at least `desired` bytes in buffer
+///  - ensures at least `desired` bytes in buffer
 ///
 /// TODO(aktau): fold with kvec/garray
-static void dyn_buf_ensure(dyn_buffer_t *buf, size_t desired)
+static void dynamic_buffer_ensure(DynamicBuffer *buf, size_t desired)
 {
   if (buf->cap >= desired) {
+    assert(buf->data);
     return;
   }
 
@@ -336,17 +298,37 @@ static void dyn_buf_ensure(dyn_buffer_t *buf, size_t desired)
   buf->data = xrealloc(buf->data, buf->cap);
 }
 
-static void system_data_cb(RStream *rstream, void *data, bool eof)
+static void system_data_cb(Stream *stream, RBuffer *buf, size_t count,
+    void *data, bool eof)
 {
-  Job *job = data;
-  dyn_buffer_t *buf = job_data(job);
+  DynamicBuffer *dbuf = data;
 
-  size_t nread = rstream_available(rstream);
+  size_t nread = buf->size;
+  dynamic_buffer_ensure(dbuf, dbuf->len + nread + 1);
+  rbuffer_read(buf, dbuf->data + dbuf->len, nread);
+  dbuf->len += nread;
+}
 
-  dyn_buf_ensure(buf, buf->len + nread + 1);
-  rstream_read(rstream, buf->data + buf->len, nread);
+static void out_data_cb(Stream *stream, RBuffer *buf, size_t count, void *data,
+    bool eof)
+{
+  size_t cnt;
+  char *ptr = rbuffer_read_ptr(buf, &cnt);
 
-  buf->len += nread;
+  if (!cnt) {
+    return;
+  }
+
+  size_t written = write_output(ptr, cnt, false, eof);
+  // No output written, force emptying the Rbuffer if it is full.
+  if (!written && rbuffer_size(buf) == rbuffer_capacity(buf)) {
+    screen_del_lines(0, 0, 1, (int)Rows, NULL);
+    screen_puts_len((char_u *)ptr, (int)cnt, (int)Rows - 1, 0, 0);
+    written = cnt;
+  }
+  if (written) {
+    rbuffer_consumed(buf, written);
+  }
 }
 
 /// Parses a command string into a sequence of words, taking quotes into
@@ -356,9 +338,9 @@ static void system_data_cb(RStream *rstream, void *data, bool eof)
 /// @param argv The vector that will be filled with copies of the parsed
 ///        words. It can be NULL if the caller only needs to count words.
 /// @return The number of words parsed.
-static int tokenize(const char_u *str, char **argv)
+static size_t tokenize(const char_u *str, char **argv)
 {
-  int argc = 0, len;
+  size_t argc = 0, len;
   char_u *p = (char_u *) str;
 
   while (*p != NUL) {
@@ -383,11 +365,11 @@ static int tokenize(const char_u *str, char **argv)
 ///
 /// @param str A pointer to the first character of the word
 /// @return The offset from `str` at which the word ends.
-static int word_length(const char_u *str)
+static size_t word_length(const char_u *str)
 {
   const char_u *p = str;
   bool inquote = false;
-  int length = 0;
+  size_t length = 0;
 
   // Move `p` to the end of shell word by advancing the pointer while it's
   // inside a quote or it's a non-whitespace character
@@ -404,29 +386,16 @@ static int word_length(const char_u *str)
   return length;
 }
 
-/// To remain compatible with the old implementation(which forked a process
+/// To remain compatible with the old implementation (which forked a process
 /// for writing) the entire text is copied to a temporary buffer before the
-/// event loop starts. If we don't(by writing in chunks returned by `ml_get`)
+/// event loop starts. If we don't (by writing in chunks returned by `ml_get`)
 /// the buffer being modified might get modified by reading from the process
 /// before we finish writing.
-/// Queues selected range for writing to the child process stdin.
-///
-/// @param req The structure containing information to peform the write
-static void write_selection(uv_write_t *req)
+static void read_input(DynamicBuffer *buf)
 {
-  ProcessData *pdata = (ProcessData *)req->data;
-  // TODO(tarruda): use a static buffer for up to a limit(BUFFER_LENGTH) and
-  // only after filled we should start allocating memory(skip unnecessary
-  // allocations for small writes)
-  int buflen = BUFFER_LENGTH;
-  pdata->wbuffer = (char *)xmalloc(buflen);
-  uv_buf_t uvbuf;
+  size_t written = 0, l = 0, len = 0;
   linenr_T lnum = curbuf->b_op_start.lnum;
-  int off = 0;
-  int written = 0;
-  char_u      *lp = ml_get(lnum);
-  int l;
-  int len;
+  char_u *lp = ml_get(lnum);
 
   for (;;) {
     l = strlen((char *)lp + written);
@@ -435,26 +404,18 @@ static void write_selection(uv_write_t *req)
     } else if (lp[written] == NL) {
       // NL -> NUL translation
       len = 1;
-      if (off + len >= buflen) {
-        // Resize the buffer
-        buflen *= 2;
-        pdata->wbuffer = xrealloc(pdata->wbuffer, buflen);
-      }
-      pdata->wbuffer[off++] = NUL;
+      dynamic_buffer_ensure(buf, buf->len + len);
+      buf->data[buf->len++] = NUL;
     } else {
       char_u  *s = vim_strchr(lp + written, NL);
-      len = s == NULL ? l : s - (lp + written);
-      while (off + len >= buflen) {
-        // Resize the buffer
-        buflen *= 2;
-        pdata->wbuffer = xrealloc(pdata->wbuffer, buflen);
-      }
-      memcpy(pdata->wbuffer + off, lp + written, len);
-      off += len;
+      len = s == NULL ? l : (size_t)(s - (lp + written));
+      dynamic_buffer_ensure(buf, buf->len + len);
+      memcpy(buf->data + buf->len, lp + written, len);
+      buf->len += len;
     }
+
     if (len == l) {
-      // Finished a line, add a NL, unless this line
-      // should not have one.
+      // Finished a line, add a NL, unless this line should not have one.
       // FIXME need to make this more readable
       if (lnum != curbuf->b_op_end.lnum
           || !curbuf->b_p_bin
@@ -462,12 +423,8 @@ static void write_selection(uv_write_t *req)
             && (lnum !=
               curbuf->b_ml.ml_line_count
               || curbuf->b_p_eol))) {
-        if (off + 1 >= buflen) {
-          // Resize the buffer
-          buflen *= 2;
-          pdata->wbuffer = xrealloc(pdata->wbuffer, buflen);
-        }
-        pdata->wbuffer[off++] = NL;
+        dynamic_buffer_ensure(buf, buf->len + 1);
+        buf->data[buf->len++] = NL;
       }
       ++lnum;
       if (lnum > curbuf->b_op_end.lnum) {
@@ -479,111 +436,67 @@ static void write_selection(uv_write_t *req)
       written += len;
     }
   }
-
-  uvbuf.base = pdata->wbuffer;
-  uvbuf.len = off;
-
-  uv_write(req, pdata->shell_stdin, &uvbuf, 1, write_cb);
 }
 
-// "Allocates" a buffer for reading from the shell stdout.
-static void alloc_cb(uv_handle_t *handle, size_t suggested, uv_buf_t *buf)
+static size_t write_output(char *output, size_t remaining, bool to_buffer,
+                           bool eof)
 {
-  ProcessData *pdata = (ProcessData *)handle->data;
-
-  if (pdata->reading) {
-    buf->len = 0;
-    return;
+  if (!output) {
+    return 0;
   }
+  char replacement_NUL = to_buffer ? NL : 1;
 
-  buf->base = pdata->rbuffer;
-  buf->len = BUFFER_LENGTH;
-  // Avoid `alloc_cb`, `alloc_cb` sequences on windows
-  pdata->reading = true;
-}
-
-static void read_cb(uv_stream_t *stream, ssize_t cnt, const uv_buf_t *buf)
-{
-  // TODO(tarruda): avoid using a growable array for this, refactor the
-  // algorithm to call `ml_append` directly(skip unnecessary copies/resizes)
-  int i;
-  ProcessData *pdata = (ProcessData *)stream->data;
-
-  if (cnt <= 0) {
-    if (cnt != UV_ENOBUFS) {
-      uv_read_stop(stream);
-      uv_close((uv_handle_t *)stream, NULL);
-      pdata->exited++;
-    }
-    return;
-  }
-
-  for (i = 0; i < cnt; ++i) {
-    if (pdata->rbuffer[i] == NL) {
+  char *start = output;
+  size_t off = 0;
+  int lastrow = (int)Rows - 1;
+  while (off < remaining) {
+    if (output[off] == NL) {
       // Insert the line
-      append_ga_line(&pdata->ga);
-    } else if (pdata->rbuffer[i] == NUL) {
+      if (to_buffer) {
+        output[off] = NUL;
+        ml_append(curwin->w_cursor.lnum++, (char_u *)output, (int)off + 1,
+                  false);
+      } else {
+        screen_del_lines(0, 0, 1, (int)Rows, NULL);
+        screen_puts_len((char_u *)output, (int)off, lastrow, 0, 0);
+      }
+      size_t skip = off + 1;
+      output += skip;
+      remaining -= skip;
+      off = 0;
+      continue;
+    }
+
+    if (output[off] == NUL) {
       // Translate NUL to NL
-      ga_append(&pdata->ga, NL);
-    } else {
-      // buffer data into the grow array
-      ga_append(&pdata->ga, pdata->rbuffer[i]);
+      output[off] = replacement_NUL;
+    }
+    off++;
+  }
+
+  if (eof) {
+    if (remaining) {
+      if (to_buffer) {
+        // append unfinished line
+        ml_append(curwin->w_cursor.lnum++, (char_u *)output, 0, false);
+        // remember that the NL was missing
+        curbuf->b_no_eol_lnum = curwin->w_cursor.lnum;
+      } else {
+        screen_del_lines(0, 0, 1, (int)Rows, NULL);
+        screen_puts_len((char_u *)output, (int)remaining, lastrow, 0, 0);
+      }
+      output += remaining;
+    } else if (to_buffer) {
+      curbuf->b_no_eol_lnum = 0;
     }
   }
 
-  windgoto(msg_row, msg_col);
-  cursor_on();
-  out_flush();
+  ui_flush();
 
-  pdata->reading = false;
+  return (size_t)(output - start);
 }
 
-static void write_cb(uv_write_t *req, int status)
+static void shell_write_cb(Stream *stream, void *data, int status)
 {
-  ProcessData *pdata = (ProcessData *)req->data;
-  uv_close((uv_handle_t *)pdata->shell_stdin, NULL);
-  pdata->exited++;
-}
-
-/// Cleanup memory and restore state modified by `os_call_shell`.
-///
-/// @param data State shared by all functions collaborating with
-///        `os_call_shell`.
-/// @param opts Process spawning options, containing some allocated memory
-/// @param shellopts Options passed to `os_call_shell`. Used for deciding
-///        if/which messages are displayed.
-static int proc_cleanup_exit(ProcessData *proc_data,
-                             uv_process_options_t *proc_opts,
-                             int shellopts)
-{
-  if (proc_data->exited) {
-    if (!emsg_silent && proc_data->exit_status != 0 &&
-        !(shellopts & kShellOptSilent)) {
-      MSG_PUTS(_("\nshell returned "));
-      msg_outnum((int64_t)proc_data->exit_status);
-      msg_putchar('\n');
-    }
-  }
-
-  State = proc_data->old_state;
-
-  if (proc_data->old_mode == TMODE_RAW) {
-    // restore mode
-    settmode(TMODE_RAW);
-  }
-
-  signal_accept_deadly();
-
-  // Release argv memory
-  shell_free_argv(proc_opts->args);
-
-  return proc_data->exit_status;
-}
-
-static void exit_cb(uv_process_t *proc, int64_t status, int term_signal)
-{
-  ProcessData *data = (ProcessData *)proc->data;
-  data->exited++;
-  data->exit_status = status;
-  uv_close((uv_handle_t *)proc, NULL);
+  stream_close(stream, NULL);
 }

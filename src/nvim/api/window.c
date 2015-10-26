@@ -1,6 +1,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <limits.h>
 
 #include "nvim/api/window.h"
 #include "nvim/api/private/defs.h"
@@ -9,6 +10,7 @@
 #include "nvim/cursor.h"
 #include "nvim/window.h"
 #include "nvim/screen.h"
+#include "nvim/move.h"
 #include "nvim/misc2.h"
 
 
@@ -85,6 +87,10 @@ void window_set_cursor(Window window, ArrayOf(Integer, 2) pos, Error *err)
   win->w_cursor.coladd = 0;
   // When column is out of range silently correct it.
   check_cursor_col_win(win);
+
+  // make sure cursor is in visible range even if win != curwin
+  update_topline_win(win);
+
   update_screen(VALID);
 }
 
@@ -174,7 +180,7 @@ void window_set_width(Window window, Integer width, Error *err)
   try_end(err);
 }
 
-/// Gets a window variable
+/// Gets a window-scoped (w:) variable
 ///
 /// @param window The window handle
 /// @param name The variable name
@@ -191,7 +197,7 @@ Object window_get_var(Window window, String name, Error *err)
   return dict_get_value(win->w_vars, name, err);
 }
 
-/// Sets a window variable. Passing 'nil' as value deletes the variable.
+/// Sets a window-scoped (w:) variable. 'nil' value deletes the variable.
 ///
 /// @param window The window handle
 /// @param name The variable name

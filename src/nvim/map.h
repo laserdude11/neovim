@@ -5,7 +5,7 @@
 
 #include "nvim/map_defs.h"
 #include "nvim/api/private/defs.h"
-#include "nvim/os/msgpack_rpc.h"
+#include "nvim/msgpack_rpc/defs.h"
 
 #define MAP_DECLS(T, U)                                                       \
   KHASH_DECLARE(T##_##U##_map, T, U)                                          \
@@ -19,13 +19,15 @@
   U map_##T##_##U##_get(Map(T, U) *map, T key);                               \
   bool map_##T##_##U##_has(Map(T, U) *map, T key);                            \
   U map_##T##_##U##_put(Map(T, U) *map, T key, U value);                      \
-  U map_##T##_##U##_del(Map(T, U) *map, T key);
+  U map_##T##_##U##_del(Map(T, U) *map, T key);                               \
+  void map_##T##_##U##_clear(Map(T, U) *map);
 
+MAP_DECLS(int, int)
 MAP_DECLS(cstr_t, uint64_t)
 MAP_DECLS(cstr_t, ptr_t)
 MAP_DECLS(ptr_t, ptr_t)
 MAP_DECLS(uint64_t, ptr_t)
-MAP_DECLS(String, rpc_method_handler_fn)
+MAP_DECLS(String, MsgpackRpcRequestHandler)
 
 #define map_new(T, U) map_##T##_##U##_new
 #define map_free(T, U) map_##T##_##U##_free
@@ -33,6 +35,7 @@ MAP_DECLS(String, rpc_method_handler_fn)
 #define map_has(T, U) map_##T##_##U##_has
 #define map_put(T, U) map_##T##_##U##_put
 #define map_del(T, U) map_##T##_##U##_del
+#define map_clear(T, U) map_##T##_##U##_clear
 
 #define pmap_new(T) map_new(T, ptr_t)
 #define pmap_free(T) map_free(T, ptr_t)
@@ -40,6 +43,7 @@ MAP_DECLS(String, rpc_method_handler_fn)
 #define pmap_has(T) map_has(T, ptr_t)
 #define pmap_put(T) map_put(T, ptr_t)
 #define pmap_del(T) map_del(T, ptr_t)
+#define pmap_clear(T) map_clear(T, ptr_t)
 
 #define map_foreach(map, key, value, block) \
   kh_foreach(map->table, key, value, block)

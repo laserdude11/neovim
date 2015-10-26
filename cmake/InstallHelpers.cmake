@@ -1,3 +1,6 @@
+# For $CMAKE_INSTALL_{DATAROOT,MAN, ...}DIR
+include(GNUInstallDirs)
+
 # This will create any directories that need to be created in the destination
 # path with the typical owner, group, and user permissions--independent of the
 # umask setting.
@@ -22,18 +25,17 @@ function(create_install_dir_with_perms)
 
   install(CODE
     "
-    if(ENV{DESTDIR})
-      set(PREFIX \$ENV{DESTDIR}/\${CMAKE_INSTALL_PREFIX})
-    else()
-      set(PREFIX \${CMAKE_INSTALL_PREFIX})
-    endif()
-
-    set(_current_dir \"\${PREFIX}/${_install_dir_DESTINATION}\")
+    set(_current_dir \"\${CMAKE_INSTALL_PREFIX}/${_install_dir_DESTINATION}\")
     set(_dir_permissions \"${_install_dir_DIRECTORY_PERMISSIONS}\")
 
     set(_parent_dirs)
-    while(NOT EXISTS \${_current_dir})
+    set(_prev_dir)
+
+    # Explicitly prepend DESTDIR when using EXISTS.
+    # file(INSTALL ...) implicitly respects DESTDIR, but EXISTS does not.
+    while(NOT EXISTS \$ENV{DESTDIR}\${_current_dir} AND NOT \${_prev_dir} STREQUAL \${_current_dir})
       list(APPEND _parent_dirs \${_current_dir})
+      set(_prev_dir \${_current_dir})
       get_filename_component(_current_dir \${_current_dir} PATH)
     endwhile()
 
@@ -46,6 +48,8 @@ function(create_install_dir_with_perms)
     # 3.0.2.
     foreach(_current_dir \${_parent_dirs})
       if(NOT IS_DIRECTORY \${_current_dir})
+        # file(INSTALL ...) implicitly respects DESTDIR, so there's no need to
+        # prepend it here.
         file(INSTALL DESTINATION \${_current_dir}
           TYPE DIRECTORY
           DIR_PERMISSIONS \${_dir_permissions}
@@ -89,6 +93,13 @@ function(install_helper)
       WORLD_READ)
   endif()
 
+  if(NOT _install_helper_PROGRAM_PERMISSIONS)
+    set(_install_helper_PROGRAM_PERMISSIONS
+      OWNER_READ OWNER_WRITE OWNER_EXECUTE
+      GROUP_READ GROUP_EXECUTE
+      WORLD_READ WORLD_EXECUTE)
+  endif()
+
   if(_install_helper_RENAME)
     set(RENAME RENAME ${_install_helper_RENAME})
   endif()
@@ -99,11 +110,11 @@ function(install_helper)
 
   if(_install_helper_TARGETS)
     # Ensure the bin area exists with the correct permissions.
-    create_install_dir_with_perms(DESTINATION bin)
+    create_install_dir_with_perms(DESTINATION ${CMAKE_INSTALL_BINDIR})
 
     install(
       TARGETS ${_install_helper_TARGETS}
-      RUNTIME DESTINATION bin)
+      RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
   else()
     create_install_dir_with_perms(
       DESTINATION ${_install_helper_DESTINATION}
@@ -130,7 +141,7 @@ function(install_helper)
     install(
       PROGRAMS ${_install_helper_PROGRAMS}
       DESTINATION ${_install_helper_DESTINATION}
-      PERMISSIONS ${_install_helper_FILE_PERMISSIONS}
+      PERMISSIONS ${_install_helper_PROGRAM_PERMISSIONS}
       ${RENAME})
   endif()
 endfunction()
